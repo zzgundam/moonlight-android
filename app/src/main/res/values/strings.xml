@@ -743,4 +743,8 @@
 
     <string name="title_checkbox_full_screen">Enable Full Screen</string>
     <string name="summary_checkbox_full_screen">Hide system bars with immersive mode</string>
+    <string name="title_checkbox_frame_interp">Frame interpolation</string>
+    <string name="summary_checkbox_frame_interp">Generate in-between frames on the GPU for the 2D stream view (60 to 120 FPS look). Uses Qualcomm hardware motion estimation on supported Adreno devices, with a shader fallback. Increases GPU load; synthesized frames are not real game output.</string>
+    <string name="title_frame_interp_multiplier">Interpolation multiplier</string>
+    <string name="summary_frame_interp_multiplier">How many output frames per source frame (requires a display refresh rate of the same multiple).</string>
 </resources>

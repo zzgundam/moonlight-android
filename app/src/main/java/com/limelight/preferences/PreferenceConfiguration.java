@@ -78,6 +78,8 @@ public class PreferenceConfiguration {
     private static final String MOUSE_NAV_BUTTONS_STRING = "checkbox_mouse_nav_buttons";
     static final String UNLOCK_FPS_STRING = "checkbox_unlock_fps";
     private static final String VIBRATE_OSC_PREF_STRING = "checkbox_vibrate_osc";
+    public static final String FRAME_INTERP_ENABLED_PREF_STRING = "checkbox_frame_interp";
+    public static final String FRAME_INTERP_MULTIPLIER_PREF_STRING = "list_frame_interp_multiplier";
     private static final String VIBRATE_FALLBACK_PREF_STRING = "checkbox_vibrate_fallback";
     private static final String VIBRATE_FALLBACK_STRENGTH_PREF_STRING = "seekbar_vibrate_fallback_strength";
     private static final String FLIP_FACE_BUTTONS_PREF_STRING = "checkbox_flip_face_buttons";
@@ -144,6 +146,8 @@ public class PreferenceConfiguration {
     private static final boolean DEFAULT_ENABLE_ULTRA_LOW_LATENCY = false;
     private static final boolean DEFAULT_ENFORCE_DISPLAY_MODE = false;
     private static final boolean DEFAULT_USE_VIRTUAL_DISPLAY = false;
+    private static final boolean DEFAULT_FRAME_INTERP = false;
+    private static final int DEFAULT_FRAME_INTERP_MULTIPLIER = 2;
     private static final String DEFAULT_VIDEO_SCALE_MODE = "fit";
     private static final boolean DEFAULT_AUTO_INVERT_VIDEO_RESOLUTION = true;
     private static final int DEFAULT_RESOLUTION_SCALE_FACTOR = 100;
@@ -250,6 +254,8 @@ public class PreferenceConfiguration {
     public ScaleMode videoScaleMode;
     public String language;
     public int renderMode;
+    public boolean frameInterpolation;
+    public int frameInterpolationMultiplier;
     public boolean smallIconMode, multiController, usbDriver, flipFaceButtons;
     public boolean onscreenController;
     public boolean hideOSCWhenHasGamepad;
@@ -893,6 +899,19 @@ private static int getFramePacingValue(Context context) {
         String renderMode = prefs.getString("render_mode_list", "0");
         int renderModeInt = Integer.parseInt(renderMode);
         config.renderMode = renderModeInt;
+
+        // Frame interpolation (2D stream view)
+        config.frameInterpolation = prefs.getBoolean(FRAME_INTERP_ENABLED_PREF_STRING, DEFAULT_FRAME_INTERP);
+        try {
+            config.frameInterpolationMultiplier = Integer.parseInt(
+                    prefs.getString(FRAME_INTERP_MULTIPLIER_PREF_STRING,
+                            String.valueOf(DEFAULT_FRAME_INTERP_MULTIPLIER)));
+        } catch (NumberFormatException e) {
+            config.frameInterpolationMultiplier = DEFAULT_FRAME_INTERP_MULTIPLIER;
+        }
+        if (config.frameInterpolationMultiplier < 2 || config.frameInterpolationMultiplier > 4) {
+            config.frameInterpolationMultiplier = DEFAULT_FRAME_INTERP_MULTIPLIER;
+        }
 
         // Read mouse mode and set touch settings accordingly
         String mouseMode = prefs.getString("mouse_mode_list", "0");
