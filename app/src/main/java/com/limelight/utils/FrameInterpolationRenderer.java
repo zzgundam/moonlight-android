@@ -46,6 +46,9 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     }
 
     private static final int GL_TEXTURE_EXTERNAL_OES = 0x8D65;
+    // Not exposed by Android's GLES30 class; values from the GLES spec.
+    private static final int GL_TEXTURE_WIDTH = 0x1000;
+    private static final int GL_TEXTURE_HEIGHT = 0x1001;
     private static final float[] QUAD_VERTICES = {-1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f};
     private static final float[] TEXTURE_VERTICES = {0.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f};
 
@@ -274,8 +277,8 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         }
 
         if (frameWidth == 0) {
-            int w = GLES30.glGetTexLevelParameteri(GL_TEXTURE_EXTERNAL_OES, 0, GLES30.GL_TEXTURE_WIDTH);
-            int h = GLES30.glGetTexLevelParameteri(GL_TEXTURE_EXTERNAL_OES, 0, GLES30.GL_TEXTURE_HEIGHT);
+            int w = GLES30.glGetTexLevelParameteri(GL_TEXTURE_EXTERNAL_OES, 0, GL_TEXTURE_WIDTH);
+            int h = GLES30.glGetTexLevelParameteri(GL_TEXTURE_EXTERNAL_OES, 0, GL_TEXTURE_HEIGHT);
             if (w <= 0 || h <= 0) {
                 w = glSurfaceView.getWidth();
                 h = glSurfaceView.getHeight();
