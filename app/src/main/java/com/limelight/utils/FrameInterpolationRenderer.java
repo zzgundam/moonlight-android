@@ -47,7 +47,9 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
 
     private static final int GL_TEXTURE_EXTERNAL_OES = 0x8D65;
     private static final float[] QUAD_VERTICES = {-1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f};
-    private static final float[] TEXTURE_VERTICES = {0.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f};
+    // Standard (unflipped) GL texture coords: the SurfaceTexture transform
+    // matrix handles buffer orientation, so no manual flip here.
+    private static final float[] TEXTURE_VERTICES = {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f};
 
     // GLSL fallback motion estimation parameters: 8px estimation grid,
     // +/-6px coarse search (3px step) refined to 1px, 16 sparse luma taps
@@ -100,6 +102,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     private int frameFbo, lumaFbo, mvFboA, mvFboB;
 
     private int frameWidth = 0, frameHeight = 0;
+    private final float[] stMatrix = new float[16];
     private boolean hasPrevFrame = false;
     private boolean glReady = false;
     private int qcomFeatures = 0;
@@ -201,6 +204,13 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
 
         glReady = engine != ENGINE_NONE;
 
+        if (engine != ENGINE_NONE && copyProgram == 0) {
+            // Without the OES copy pass nothing can be displayed correctly.
+            LimeLog.severe("Frame interpolation: OES copy program failed to compile, interpolation disabled");
+            engine = ENGINE_NONE;
+            glReady = false;
+        }
+
         if (onSurfaceReadyListener != null) {
             onSurfaceReadyListener.onFrameInterpSurfaceReady(videoSurface);
         }
@@ -268,6 +278,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     private void ingestFrame(long now) {
         try {
             videoSurfaceTexture.updateTexImage();
+            videoSurfaceTexture.getTransformMatrix(stMatrix);
         } catch (Exception e) {
             LimeLog.warning("Frame interpolation: updateTexImage failed: " + e.getMessage());
             return;
@@ -296,7 +307,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         }
 
         // Copy decoded frame into the curr texture and its luma
-        copyExternalToTexture(videoTextureId, frameTexB);
+        copyExternalToTexture(videoTextureId, frameTexB, stMatrix);
         renderLuma(frameTexB, lumaTexB);
 
         if (hasPrevFrame) {
@@ -341,7 +352,8 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         if (!glReady) {
             return;
         }
-        drawTextureToScreen(frameTexB != 0 ? frameTexB : frameTexA);
+        // After the swap in ingestFrame(), frameTexA holds the newest frame.
+        drawTextureToScreen(frameTexA != 0 ? frameTexA : frameTexB);
     }
 
     private void presentSynthetic(float phase, long now) {
@@ -349,16 +361,18 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             return;
         }
         if (engine == ENGINE_QCOM_EXTRAP) {
+            // glExtrapolateTex2DQCOM expects (prev, curr, out, factor);
+            // after the swap frameTexB is prev and frameTexA is curr.
             boolean ok = false;
             try {
-                ok = nativeExtrapolate(frameTexA, frameTexB, getSynthTex(), phase);
+                ok = nativeExtrapolate(frameTexB, frameTexA, getSynthTex(), phase);
             } catch (Throwable t) {
                 LimeLog.warning("QCOM extrapolation crashed: " + t.getMessage());
             }
             if (ok) {
                 drawTextureToScreen(synthTex);
             } else {
-                drawTextureToScreen(frameTexB);
+                drawTextureToScreen(frameTexA);
             }
             return;
         }
@@ -376,12 +390,13 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         GLES20.glUseProgram(synthProgram);
         bindQuad(synthProgram);
 
+        // After the swap frameTexA = current frame, frameTexB = previous frame.
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, frameTexB); // curr
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, frameTexA); // curr
         GLES20.glUniform1i(GLES20.glGetUniformLocation(synthProgram, "uCurr"), 0);
 
         GLES20.glActiveTexture(GLES20.GL_TEXTURE1);
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, frameTexA); // prev
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, frameTexB); // prev
         GLES20.glUniform1i(GLES20.glGetUniformLocation(synthProgram, "uPrev"), 1);
 
         GLES20.glActiveTexture(GLES20.GL_TEXTURE2);
@@ -426,7 +441,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         GLES20.glEnableVertexAttribArray(texHandle);
     }
 
-    private void copyExternalToTexture(int extTex, int destTex) {
+    private void copyExternalToTexture(int extTex, int destTex, float[] transform) {
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, frameFbo);
         GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, destTex, 0);
         GLES20.glViewport(0, 0, frameWidth, frameHeight);
@@ -435,6 +450,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
         GLES20.glBindTexture(GL_TEXTURE_EXTERNAL_OES, extTex);
         GLES20.glUniform1i(GLES20.glGetUniformLocation(copyProgram, "s_InputTexture"), 0);
+        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(copyProgram, "uTransform"), 1, false, transform, 0);
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
         GLES20.glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
@@ -710,12 +726,15 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
 
     private static final String COPY_FRAG =
             "#version 300 es\n" +
+            "#extension GL_OES_EGL_image_external_essl3 : require\n" +
             "precision mediump float;\n" +
             "uniform mediump samplerExternalOES s_InputTexture;\n" +
+            "uniform highp mat4 uTransform;\n" +
             "in vec2 vUV;\n" +
             "out vec4 outColor;\n" +
             "void main() {\n" +
-            "    outColor = texture(s_InputTexture, vUV);\n" +
+            "    vec2 tuv = (uTransform * vec4(vUV, 0.0, 1.0)).xy;\n" +
+            "    outColor = texture(s_InputTexture, tuv);\n" +
             "}\n";
 
     private static final String LUMA_FRAG =
@@ -820,7 +839,9 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             "void main() {\n" +
             "    vec2 blockCenter = vUV * uFrameSize;\n" +
             "    vec4 coarse = texture(uCoarseMV, vUV);\n" +
-            "    vec2 startMv = (coarse.rg - 0.5) * uMvRange;\n" +
+            // Encode convention (both ME passes): enc = mv / (2*uMvRange) + 0.5,
+            // so decoding must multiply by 2*uMvRange to recover pixels.
+            "    vec2 startMv = (coarse.rg - 0.5) * 2.0 * uMvRange;\n" +
             "    float best = 1e9;\n" +
             "    vec2 bestMv = startMv;\n" +
             "    for (int dy = -1; dy <= 1; dy++) {\n" +
