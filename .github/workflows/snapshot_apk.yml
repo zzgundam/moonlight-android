@@ -34,7 +34,6 @@ jobs:
       uses: nttld/setup-ndk@v1
       with:
        ndk-version: r27
-       local-cache: true
        link-to-sdk: true
 
     - name: Set Cache
