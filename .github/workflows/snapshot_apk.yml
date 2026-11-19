@@ -49,16 +49,19 @@ jobs:
     - name: Build with Gradle
       run: ./gradlew assembleDebug
 
+    - name: List APK outputs
+      run: find app/build/outputs/apk -name "*.apk" || true
+
     - name: Upload NonRoot Artifact
       uses: actions/upload-artifact@v4
       with:
         name: "auto_built_snapshot_nonRoot_${{ github.sha }}.apk"
-        path: app/build/outputs/apk/nonRoot_game/debug/app-nonRoot_game-debug.apk
+        path: app/build/outputs/apk/**/app-nonRoot*.apk
         retention-days: 10
 
     - name: Upload Root Artifact
       uses: actions/upload-artifact@v4
       with:
         name: "auto_built_snapshot_root_${{ github.sha }}.apk"
-        path: app/build/outputs/apk/root/debug/app-root-debug.apk
+        path: app/build/outputs/apk/**/app-root*.apk
         retention-days: 10
