@@ -58,6 +58,12 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     private static final int MV_GRID = 8;
     private static final float MV_RANGE = 6.0f;
 
+    // Per-pixel scene-cut / occlusion gate: when the motion-compensated prev
+    // and curr samples disagree by more than this (average RGB difference,
+    // 0..1), the blend is dropped and the current frame is shown instead.
+    // Removes cross-frame ghosting on scene changes and unreliable fast motion.
+    private static final float CUT_THRESHOLD = 0.30f;
+
     private static final long MIN_FRAME_INTERVAL_NS = 1_000_000L;
     private static final long MAX_FRAME_INTERVAL_NS = 100_000_000L;
 
@@ -456,6 +462,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         GLES20.glUniform1f(GLES20.glGetUniformLocation(synthProgram, "uMvRange"), MV_RANGE * 2.0f);
         GLES20.glUniform2f(GLES20.glGetUniformLocation(synthProgram, "uFrameSize"), frameWidth, frameHeight);
         GLES20.glUniform1f(GLES20.glGetUniformLocation(synthProgram, "uMaxMV"), MV_RANGE * 4.0f);
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(synthProgram, "uCutThresh"), CUT_THRESHOLD);
 
         // Render the synthetic frame into a texture, then present it through
         // the shared screen path (keeps viewport/letterbox handling uniform
@@ -946,6 +953,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             "uniform float uMvRange;\n" +
             "uniform vec2 uFrameSize;\n" +
             "uniform float uMaxMV;\n" +
+            "uniform float uCutThresh;\n" +
             "in vec2 vUV;\n" +
             "out vec4 outColor;\n" +
             "\n" +
@@ -973,8 +981,16 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             "\n" +
             "    vec4 blended = mix(cPrev, cCurr, uPhase);\n" +
             "    vec4 fallback = mix(cCurr, blended, 0.5 * uPhase);\n" +
-            "    outColor = mix(fallback, blended, conf);\n" +
-            "    outColor = mix(outColor, cCurr, outside * (1.0 - uPhase * 0.5));\n" +
+            "    vec4 result = mix(fallback, blended, conf);\n" +
+            "    result = mix(result, cCurr, outside * (1.0 - uPhase * 0.5));\n" +
+            "\n" +
+            "    // Scene-cut / occlusion gate: after motion compensation the two\n" +
+            "    // samples should agree for real motion. A large residual means a\n" +
+            "    // scene change or a wrong MV — blending would produce ghosting,\n" +
+            "    // so show the current frame instead.\n" +
+            "    float residual = dot(abs(cPrev.rgb - cCurr.rgb), vec3(0.3333));\n" +
+            "    float cut = smoothstep(uCutThresh, uCutThresh * 1.5, residual);\n" +
+            "    outColor = mix(result, cCurr, cut);\n" +
             "}\n";
 
     // ─── Imports that need no ambiguity ─────────────────────────────────────
