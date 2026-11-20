@@ -120,6 +120,9 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
 
     private boolean meFailed = false;
 
+    private long ingestAccumNs = 0;
+    private int ingestCount = 0;
+
     static {
         try {
             System.loadLibrary("frame-interp");
@@ -263,7 +266,26 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         }
 
         if (newFrame && glReady) {
+            // Catch up on due slots of the PREVIOUS frame pair before the new
+            // frame replaces it. When the GL loop period approaches the source
+            // frame interval, the slot vsync would otherwise always be stolen
+            // by the arriving frame and the multiplier could never be reached.
+            if (hasPrevFrame && lastFrameNanos != 0) {
+                double elapsedSlots = (now - lastFrameNanos) / frameIntervalNanos * multiplier;
+                if (elapsedSlots <= multiplier * 2.0) {
+                    int maxSlots = multiplier - 1;
+                    while (slotsPresented < maxSlots && slotsPresented + 1 <= elapsedSlots) {
+                        int slot = slotsPresented + 1;
+                        presentSynthetic((float) slot / multiplier, now);
+                        slotsPresented = slot;
+                        displayFrameCount++;
+                    }
+                }
+            }
+            long t0 = System.nanoTime();
             ingestFrame(now);
+            ingestAccumNs += System.nanoTime() - t0;
+            ingestCount++;
             presentReal();
             slotsPresented = 0;
             displayFrameCount++;
@@ -600,11 +622,14 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             fpsWindowStart = now;
             LimeLog.info("Frame interpolation: display=" + String.format("%.1f", displayFps)
                     + " source=" + String.format("%.1f", sourceFps)
-                    + " engine=" + engineString() + " x" + multiplier);
+                    + " engine=" + engineString() + " x" + multiplier
+                    + (ingestCount > 0 ? String.format(" ingestAvg=%.1fms", ingestAccumNs / 1e6 / ingestCount) : ""));
+            ingestAccumNs = 0;
+            ingestCount = 0;
         }
     }
 
-    public String engineString() {
+    public static String engineString() {
         switch (engine) {
             case ENGINE_QCOM_ME: return "QCOM-ME";
             case ENGINE_QCOM_EXTRAP: return "QCOM-EXTRAP";
