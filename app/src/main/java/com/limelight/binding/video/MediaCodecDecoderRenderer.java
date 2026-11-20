@@ -1820,7 +1820,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                     if(FrameInterpolationRenderer.isActive) {
                         sb.append(" ");
                         sb.append(context.getString(R.string.perf_overlay_interp_fps,
-                                FrameInterpolationRenderer.sourceFps, FrameInterpolationRenderer.displayFps));
+                                FrameInterpolationRenderer.sourceFps, FrameInterpolationRenderer.displayFps,
+                                FrameInterpolationRenderer.engineString()));
                     }
                     if(Stereo3DRenderer.isActive) {
                         sb.append(" ");
@@ -1858,7 +1859,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                     sb.append(context.getString(R.string.perf_overlay_renderingfps, fps.renderedFps)).append('\n');
                     if(FrameInterpolationRenderer.isActive) {
                         sb.append(context.getString(R.string.perf_overlay_interp_fps,
-                                FrameInterpolationRenderer.sourceFps, FrameInterpolationRenderer.displayFps)).append('\n');
+                                FrameInterpolationRenderer.sourceFps, FrameInterpolationRenderer.displayFps,
+                                FrameInterpolationRenderer.engineString())).append('\n');
                     }
                     sb.append(context.getString(R.string.perf_overlay_netdrops,
                             (float)lastTwo.framesLost / lastTwo.totalFrames * 100)).append('\n');
