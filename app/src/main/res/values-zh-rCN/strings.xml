@@ -719,5 +719,7 @@
     <string name="summary_checkbox_frame_interp">在 2D 串流画面上用 GPU 生成中间帧（如 60→120 的观感）。支持的高通 Adreno 设备优先使用硬件运动估计，其他设备使用着色器插帧。会增加 GPU 负载；插帧画面并非真实游戏输出。</string>
     <string name="title_frame_interp_multiplier">插帧倍率</string>
     <string name="summary_frame_interp_multiplier">每个源帧生成的输出帧数（需要屏幕刷新率为相应倍数）。</string>
+    <string name="title_checkbox_frame_interp_fbc">遮挡检查（FBC）</string>
+    <string name="summary_checkbox_frame_interp_fbc">额外跑一次反向运动估计来识别遮挡，减少快速运动时的双影/重影；每帧多一次 GPU 计算，关闭可降低 GPU 负载与发热。修改后需重新连接串流生效。</string>
     <string name="perf_overlay_interp_fps">插帧： %1$.2f &#8594; %2$.2f FPS (%3$s)</string>
 </resources>

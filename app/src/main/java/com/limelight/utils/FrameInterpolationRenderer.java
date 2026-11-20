@@ -82,6 +82,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     private final GLSurfaceView glSurfaceView;
     private final OnSurfaceReadyListener onSurfaceReadyListener;
     private final PreferenceConfiguration prefConfig;
+    private final boolean fbcEnabled;   // user setting: backward ME / FBC occlusion check
 
     private final FloatBuffer quadVertexBuffer;
     private final FloatBuffer textureVertexBuffer;
@@ -128,6 +129,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     private int qcomFeatures = 0;
     private int mvBlockX = 16, mvBlockY = 16;
     private volatile boolean halfScaleMe = true;   // half-res HW ME usable
+    private int halfScaleFailCount = 0;            // consecutive half-res ME failures
     private volatile boolean temporalPred = true;  // previous MV field usable
     private volatile boolean bwdFieldValid = false; // backward field (FBC) usable
     private float fbcThresh = 6.0f;                 // fwd+bwd disagreement cap (px)
@@ -169,12 +171,23 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         this.glSurfaceView = view;
         this.onSurfaceReadyListener = listener;
         this.prefConfig = prefConfig;
+        this.fbcEnabled = prefConfig.frameInterpolationFbc;
         FrameInterpolationRenderer.multiplier = Math.max(2, Math.min(4, prefConfig.frameInterpolationMultiplier));
+        // Seed the cadence estimate from the configured stream FPS instead of
+        // assuming 60; a 30 FPS source would otherwise look "stalled" for the
+        // first ~10 frames and skip interpolation at startup (B5).
+        this.frameIntervalNanos = defaultFrameIntervalNanos();
 
         quadVertexBuffer = ByteBuffer.allocateDirect(QUAD_VERTICES.length * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
         quadVertexBuffer.put(QUAD_VERTICES).position(0);
         textureVertexBuffer = ByteBuffer.allocateDirect(TEXTURE_VERTICES.length * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
         textureVertexBuffer.put(TEXTURE_VERTICES).position(0);
+    }
+
+    private double defaultFrameIntervalNanos() {
+        return (prefConfig != null && prefConfig.fps > 0)
+                ? 1_000_000_000.0 / prefConfig.fps
+                : 16_666_666.0;
     }
 
     public Surface getVideoSurface() {
@@ -191,6 +204,11 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
 
     @Override
     public void onSurfaceCreated(GL10 gl, EGLConfig config) {
+        halfScaleMe = true;
+        halfScaleFailCount = 0;
+        temporalPred = false;
+        meFailed = false;
+        bwdFieldValid = false;
         videoTextureId = createExternalOESTexture();
         videoSurfaceTexture = new SurfaceTexture(videoTextureId);
         videoSurfaceTexture.setOnFrameAvailableListener(this);
@@ -257,6 +275,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             LimeLog.severe("Frame interpolation: OES copy program failed to compile, interpolation disabled");
             engine = ENGINE_NONE;
             glReady = false;
+            isActive = false;
         }
 
         if (onSurfaceReadyListener != null) {
@@ -308,22 +327,12 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         }
 
         if (newFrame && glReady) {
-            // Catch up on due slots of the PREVIOUS frame pair before the new
-            // frame replaces it. When the GL loop period approaches the source
-            // frame interval, the slot vsync would otherwise always be stolen
-            // by the arriving frame and the multiplier could never be reached.
-            if (hasPrevFrame && lastFrameNanos != 0) {
-                double elapsedSlots = (now - lastFrameNanos) / frameIntervalNanos * multiplier;
-                if (elapsedSlots <= multiplier * 2.0) {
-                    int maxSlots = multiplier - 1;
-                    while (slotsPresented < maxSlots && slotsPresented + 1 <= elapsedSlots) {
-                        int slot = slotsPresented + 1;
-                        presentSynthetic((float) slot / multiplier, now);
-                        slotsPresented = slot;
-                        displayFrameCount++;
-                    }
-                }
-            }
+            // A newly decoded frame always takes this vsync. A GLSurfaceView
+            // swaps once per onDrawFrame, so "catching up" several overdue
+            // synthetic slots inside a single callback was pointless: only the
+            // last draw reached the screen, while every pass counted as a
+            // displayed frame and inflated displayFps (A6). In-between frames
+            // are produced on the vsyncs BETWEEN real frames (else branch).
             long t0 = System.nanoTime();
             ingestFrame(now);
             ingestAccumNs += System.nanoTime() - t0;
@@ -333,35 +342,37 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             displayFrameCount++;
             sourceFrameCount++;
         } else {
-            double progress = (now - lastFrameNanos) / frameIntervalNanos;
+            double progress = (lastFrameNanos != 0)
+                    ? (now - lastFrameNanos) / frameIntervalNanos : 0.0;
             if (!glReady || !hasPrevFrame || lastFrameNanos == 0) {
                 if (glReady) {
                     presentReal();
                     displayFrameCount++;
                 }
-                return;
-            }
-            if (progress > 1.35) {
+            } else if (progress > 1.35) {
                 // Stream stalled: hold the last real frame, no synthesis.
                 presentReal();
                 displayFrameCount++;
-                return;
-            }
-            int maxSlots = multiplier - 1;
-            int targetSlots = Math.min(maxSlots, (int) Math.floor(progress * multiplier));
-            if (targetSlots > slotsPresented) {
-                int slot = slotsPresented + 1;
-                float phase = (float) slot / multiplier;
-                presentSynthetic(phase, now);
-                slotsPresented = slot;
-                displayFrameCount++;
             } else {
-                // No new slot this vsync: re-present the last frame so the
-                // back buffer always holds valid content (never uninitialized).
-                drawTextureToScreen(lastScreenTex);
+                int maxSlots = multiplier - 1;
+                int targetSlots = Math.min(maxSlots, (int) Math.floor(progress * multiplier));
+                if (targetSlots > slotsPresented) {
+                    int slot = slotsPresented + 1;
+                    float phase = (float) slot / multiplier;
+                    presentSynthetic(phase, now);
+                    slotsPresented = slot;
+                    displayFrameCount++;
+                } else {
+                    // No new slot this vsync: re-present the last frame so the
+                    // back buffer always holds valid content (never garbage).
+                    // A repeat, not a new displayed frame -> do NOT count it.
+                    drawTextureToScreen(lastScreenTex);
+                }
             }
         }
 
+        // Always settle the FPS window, including the branches that used to
+        // return early (stall / not-ready), which froze the overlay (A4).
         updateFps(now);
     }
 
@@ -425,6 +436,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     }
 
     private void runMotionEstimation() {
+        meFailed = false;   // reset per real frame (A3: was write-only before)
         if (engine == ENGINE_QCOM_ME) {
             boolean okFull = false;
             try {
@@ -444,9 +456,13 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
                 } catch (Throwable t) {
                     LimeLog.warning("QCOM half-res motion estimation crashed: " + t.getMessage());
                 }
-                if (!okHalf) {
+                if (okHalf) {
+                    halfScaleFailCount = 0;
+                } else if (++halfScaleFailCount >= 8) {
+                    // A single glitch used to disable range extension for the
+                    // whole session (A8). Only a sustained failure does now.
                     halfScaleMe = false;
-                    LimeLog.warning("QCOM half-res ME unavailable, search-range extension disabled");
+                    LimeLog.warning("QCOM half-res ME failed repeatedly, search-range extension disabled");
                 }
             }
 
@@ -461,15 +477,22 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
                 // interpolated when the forward MV at its position and the
                 // backward MV at the warped position agree (fwd + bwd ~ 0);
                 // disagreement marks occlusion, where blending would ghost.
-                boolean okBwd = false;
-                try {
-                    okBwd = nativeEstimateMotion(lumaTexB, lumaTexA, mvTexBwd);
-                } catch (Throwable t) {
-                    LimeLog.warning("QCOM backward motion estimation crashed: " + t.getMessage());
-                }
-                if (okBwd && mvBwdSm != 0) {
-                    renderSmoothField(mvTexBwd, mvBwdSm);
-                    bwdFieldValid = true;
+                // This is the third full-resolution HW ME pass per frame, so it
+                // is gated by the user setting; OFF keeps the single-direction
+                // gates (confidence / residual / divergence) only.
+                if (fbcEnabled) {
+                    boolean okBwd = false;
+                    try {
+                        okBwd = nativeEstimateMotion(lumaTexB, lumaTexA, mvTexBwd);
+                    } catch (Throwable t) {
+                        LimeLog.warning("QCOM backward motion estimation crashed: " + t.getMessage());
+                    }
+                    if (okBwd && mvBwdSm != 0) {
+                        renderSmoothField(mvTexBwd, mvBwdSm);
+                        bwdFieldValid = true;
+                    } else {
+                        bwdFieldValid = false;
+                    }
                 } else {
                     bwdFieldValid = false;
                 }
@@ -515,6 +538,14 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             return;
         }
 
+        if (meFailed) {
+            // All HW motion passes failed for this frame pair: the MV field
+            // still holds the previous pair's vectors. Hold the real frame
+            // instead of synthesizing from stale motion (A3).
+            drawTextureToScreen(frameTexA);
+            return;
+        }
+
         int mvTex;
         float mvMode;
         if (engine == ENGINE_QCOM_ME) {
@@ -557,15 +588,19 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         GLES20.glUniform1f(GLES20.glGetUniformLocation(synthProgram, "uCutThresh"), CUT_THRESHOLD);
         GLES20.glUniform2f(GLES20.glGetUniformLocation(synthProgram, "uMvGrid"),
                 Math.max(1, mvGridW), Math.max(1, mvGridH));
-        // Motion-field divergence gate: discontinuities larger than ~5.5% of
-        // the frame width mark object boundaries / occlusions where a blend
-        // would produce a double silhouette.
+        // Motion-field divergence gate. QCOM vectors are large (calibrated to
+        // a fraction of the frame width); the GLSL fallback only searches
+        // +/-MV_RANGE px, so it needs a proportionally small threshold or the
+        // gate never fires at all (B2).
+        float divThresh = (engine == ENGINE_QCOM_ME)
+                ? Math.max(24.0f, frameWidth * 0.055f)
+                : Math.max(4.0f, MV_RANGE * 1.5f);
         GLES20.glUniform1f(GLES20.glGetUniformLocation(synthProgram, "uDivThresh"),
-                Math.max(24.0f, frameWidth * 0.055f));
+                divThresh);
 
         // Backward motion field for forward-backward consistency (QCOM only;
         // the GLSL engine has no backward field and keeps its residual gates).
-        boolean fbc = (engine == ENGINE_QCOM_ME) && bwdFieldValid && mvBwdSm != 0;
+        boolean fbc = fbcEnabled && (engine == ENGINE_QCOM_ME) && bwdFieldValid && mvBwdSm != 0;
         GLES20.glActiveTexture(GLES20.GL_TEXTURE3);
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fbc ? mvBwdSm : frameTexA);
         GLES20.glUniform1i(GLES20.glGetUniformLocation(synthProgram, "uMvBwd"), 3);
@@ -933,7 +968,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             }
             LimeLog.info("Frame interpolation: QCOM ME block " + mvBlockX + "x" + mvBlockY
                     + ", grid " + mvGridW + "x" + mvGridH + ", multiscale="
-                    + (mvRawFusedTex != 0));
+                    + (mvRawFusedTex != 0) + ", fbc=" + fbcEnabled);
         }
     }
 
@@ -998,29 +1033,39 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             videoSurfaceTexture.release();
             videoSurfaceTexture = null;
         }
+
+        // Snapshot every GL id into final locals BEFORE queueing the async
+        // cleanup (A1 + race fix). The old lambda referenced instance fields,
+        // so a fast surface recreation could make it delete the NEW resources.
+        final int[] progSnap = {copyProgram, lumaProgram, lumaHalfProgram, meProgram,
+                refineProgram, fuseProgram, smoothProgram, synthProgram,
+                presentProgram, inpaintProgram};
+        final int[] texSnap = {videoTextureId, frameTexA, frameTexB, lumaTexA, lumaTexB,
+                lumaHalfA, lumaHalfB, mvTexA, mvTexB, mvTexHw, mvTexHwHalf,
+                mvTexBwd, mvBwdSm, mvRawFusedTex, mvSmA, mvSmB, synthTex, synthTex2};
+        final int[] fboSnap = {frameFbo, lumaFbo, lumaHalfFbo, synthFbo,
+                mvFboA, mvFboB, fuseFbo, smoothFbo};
+
         if (glSurfaceView != null) {
             glSurfaceView.queueEvent(() -> {
-                int[] programs = {copyProgram, lumaProgram, meProgram, refineProgram, synthProgram, presentProgram};
-                for (int p : programs) {
-                    if (p != 0) {
+                // De-duplicate: on QCOM_EXTRAP synthProgram == presentProgram.
+                java.util.HashSet<Integer> seen = new java.util.HashSet<>();
+                for (int p : progSnap) {
+                    if (p != 0 && seen.add(p)) {
                         GLES20.glDeleteProgram(p);
                     }
                 }
-                int[] textures = {videoTextureId, frameTexA, frameTexB, lumaTexA, lumaTexB,
-                        lumaHalfA, lumaHalfB, mvTexA, mvTexB, mvTexHw, mvTexHwHalf,
-                        mvRawFusedTex, mvSmA, mvSmB, synthTex};
                 int count = 0;
-                int[] compact = new int[textures.length];
-                for (int t : textures) {
+                int[] compact = new int[texSnap.length];
+                for (int t : texSnap) {
                     if (t != 0) compact[count++] = t;
                 }
                 if (count > 0) {
                     GLES20.glDeleteTextures(count, compact, 0);
                 }
-                int[] fbos = {frameFbo, lumaFbo, lumaHalfFbo, synthFbo, mvFboA, mvFboB, fuseFbo, smoothFbo};
                 int fCount = 0;
-                int[] fCompact = new int[fbos.length];
-                for (int f : fbos) {
+                int[] fCompact = new int[fboSnap.length];
+                for (int f : fboSnap) {
                     if (f != 0) fCompact[fCount++] = f;
                 }
                 if (fCount > 0) {
@@ -1028,6 +1073,9 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
                 }
             });
         }
+
+        // Full state reset (A5). Cadence/stat fields were previously left
+        // stale, corrupting pacing and FPS right after a surface rebuild.
         glReady = false;
         isActive = false;
         hasPrevFrame = false;
@@ -1037,16 +1085,39 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         surfaceHeight = 0;
         lastScreenTex = 0;
         lastFrameNanos = 0;
+        frameIntervalNanos = defaultFrameIntervalNanos();
+        slotsPresented = 0;
+        fpsWindowStart = 0;
+        displayFrameCount = 0;
+        sourceFrameCount = 0;
+        ingestAccumNs = 0;
+        ingestCount = 0;
+        meFailed = false;
+        halfScaleMe = true;
+        halfScaleFailCount = 0;
+        temporalPred = false;
+        bwdFieldValid = false;
+        fbcThresh = 6.0f;
         engine = ENGINE_NONE;
         displayFps = 0;
         sourceFps = 0;
         mvGridW = 0;
         mvGridH = 0;
-        smCurr = 0;
-        smPrev = 0;
-        synthTex2 = 0;
-        bwdFieldValid = false;
-        temporalPred = false;
+
+        // Clear every live id so a rebuilt surface re-allocates from scratch
+        // (getSynthTex() is lazy and would otherwise reuse a deleted handle).
+        copyProgram = 0; lumaProgram = 0; lumaHalfProgram = 0; meProgram = 0;
+        refineProgram = 0; fuseProgram = 0; smoothProgram = 0; synthProgram = 0;
+        presentProgram = 0; inpaintProgram = 0;
+        videoTextureId = 0;
+        frameTexA = 0; frameTexB = 0; lumaTexA = 0; lumaTexB = 0;
+        lumaHalfA = 0; lumaHalfB = 0; mvTexA = 0; mvTexB = 0;
+        mvTexHw = 0; mvTexHwHalf = 0; mvTexBwd = 0; mvBwdSm = 0;
+        mvRawFusedTex = 0; mvSmA = 0; mvSmB = 0;
+        smCurr = 0; smPrev = 0;
+        synthTex = 0; synthTex2 = 0; synthFbo = 0;
+        frameFbo = 0; lumaFbo = 0; lumaHalfFbo = 0;
+        mvFboA = 0; mvFboB = 0; fuseFbo = 0; smoothFbo = 0;
     }
 
     // ─── GL helpers ──────────────────────────────────────────────────────────
@@ -1294,7 +1365,10 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             "in vec2 vUV;\n" +
             "out vec4 outColor;\n" +
             "void main() {\n" +
-            "    outColor = texture(s_InputTexture, vUV);\n" +
+            "    vec4 c = texture(s_InputTexture, vUV);\n" +
+            "    // Synthesis stores per-pixel validity in alpha; force opaque\n" +
+            "    // so a missing inpaint pass can never show transparent holes.\n" +
+            "    outColor = vec4(c.rgb, 1.0);\n" +
             "}\n";
 
     // Coarse motion estimation: 7x7 candidate grid, 3px step, +/-6px range,
@@ -1442,12 +1516,11 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             "    vec2 mvPx = decodeMv(m.rg);\n" +
             "    float conf = m.b;\n" +
             "\n" +
-            "    // Uninitialised / NaN fields must degrade to 'no motion'.\n" +
-            "    if (isnan(mvPx.x) || isnan(mvPx.y)) mvPx = vec2(0.0);\n" +
-            "    if (isnan(conf)) conf = 0.0;\n" +
-            "    conf = clamp(conf, 0.0, 1.0);\n" +
-            "\n" +
-            "    if (length(mvPx) > uMaxMV) {\n" +
+            "    // GLSL ES 3.00 has no isnan(). A NaN fails every comparison\n" +
+            "    // (x==x is false, x<k is false), so invert the magnitude test\n" +
+            "    // to reject NaN/Inf and out-of-range vectors in one branch.\n" +
+            "    conf = (conf == conf) ? clamp(conf, 0.0, 1.0) : 0.0;\n" +
+            "    if (!(length(mvPx) < uMaxMV)) {\n" +
             "        mvPx = vec2(0.0);\n" +
             "        conf = 0.0;\n" +
             "    }\n" +
@@ -1467,7 +1540,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             "\n" +
             "    vec2 pc = clamp(prevUv, vec2(0.0), vec2(1.0));\n" +
             "    vec2 cc = clamp(currUv, vec2(0.0), vec2(1.0));\n" +
-            "    float outside = (pc != prevUv || cc != currUv) ? 1.0 : 0.0;\n" +
+            "    float outside = (any(notEqual(pc, prevUv)) || any(notEqual(cc, currUv))) ? 1.0 : 0.0;\n" +
             "\n" +
             "    vec4 cPrev = texture(uPrev, pc);\n" +
             "    vec4 cCurr = texture(uCurr, cc);\n" +
@@ -1486,7 +1559,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             "    // (occlusion) and any blend would place content twice.\n" +
             "    if (uFbcValid > 0.5) {\n" +
             "        vec2 mvBwd = texture(uMvBwd, cc).rg;\n" +
-            "        if (isnan(mvBwd.x) || isnan(mvBwd.y)) mvBwd = vec2(0.0);\n" +
+            "        if (!(dot(mvBwd, mvBwd) < 1.0e10)) mvBwd = vec2(0.0);\n" +
             "        float fbc = length(mvPx + mvBwd);\n" +
             "        valid *= 1.0 - smoothstep(uFbcThresh, uFbcThresh * 2.0, fbc);\n" +
             "    }\n" +
