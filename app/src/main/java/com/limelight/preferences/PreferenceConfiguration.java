@@ -80,6 +80,7 @@ public class PreferenceConfiguration {
     private static final String VIBRATE_OSC_PREF_STRING = "checkbox_vibrate_osc";
     public static final String FRAME_INTERP_ENABLED_PREF_STRING = "checkbox_frame_interp";
     public static final String FRAME_INTERP_MULTIPLIER_PREF_STRING = "list_frame_interp_multiplier";
+    public static final String FRAME_INTERP_PHASE_PREF_STRING = "list_frame_interp_phase";
     public static final String FRAME_INTERP_FBC_PREF_STRING = "checkbox_frame_interp_fbc";
     private static final String VIBRATE_FALLBACK_PREF_STRING = "checkbox_vibrate_fallback";
     private static final String VIBRATE_FALLBACK_STRENGTH_PREF_STRING = "seekbar_vibrate_fallback_strength";
@@ -149,7 +150,8 @@ public class PreferenceConfiguration {
     private static final boolean DEFAULT_USE_VIRTUAL_DISPLAY = false;
     private static final boolean DEFAULT_FRAME_INTERP = false;
     private static final int DEFAULT_FRAME_INTERP_MULTIPLIER = 2;
-    private static final boolean DEFAULT_FRAME_INTERP_FBC = true;
+    private static final int DEFAULT_FRAME_INTERP_PHASE = 0;
+    private static final boolean DEFAULT_FRAME_INTERP_FBC = false;
     private static final String DEFAULT_VIDEO_SCALE_MODE = "fit";
     private static final boolean DEFAULT_AUTO_INVERT_VIDEO_RESOLUTION = true;
     private static final int DEFAULT_RESOLUTION_SCALE_FACTOR = 100;
@@ -258,6 +260,7 @@ public class PreferenceConfiguration {
     public int renderMode;
     public boolean frameInterpolation;
     public int frameInterpolationMultiplier;
+    public int frameInterpolationPhase;
     public boolean frameInterpolationFbc;
     public boolean smallIconMode, multiController, usbDriver, flipFaceButtons;
     public boolean onscreenController;
@@ -914,6 +917,16 @@ private static int getFramePacingValue(Context context) {
         }
         if (config.frameInterpolationMultiplier < 2 || config.frameInterpolationMultiplier > 4) {
             config.frameInterpolationMultiplier = DEFAULT_FRAME_INTERP_MULTIPLIER;
+        }
+        try {
+            config.frameInterpolationPhase = Integer.parseInt(
+                    prefs.getString(FRAME_INTERP_PHASE_PREF_STRING,
+                            String.valueOf(DEFAULT_FRAME_INTERP_PHASE)));
+        } catch (NumberFormatException e) {
+            config.frameInterpolationPhase = DEFAULT_FRAME_INTERP_PHASE;
+        }
+        if (config.frameInterpolationPhase < 0 || config.frameInterpolationPhase > 3) {
+            config.frameInterpolationPhase = DEFAULT_FRAME_INTERP_PHASE;
         }
         config.frameInterpolationFbc = prefs.getBoolean(FRAME_INTERP_FBC_PREF_STRING, DEFAULT_FRAME_INTERP_FBC);
 

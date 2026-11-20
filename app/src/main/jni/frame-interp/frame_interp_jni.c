@@ -1,6 +1,6 @@
 /*
  * JNI shim exposing Qualcomm Adreno frame-generation GPU extensions
- * (GL_QCOM_motion_estimation / GL_QCOM_texture_extrapolation) to the
+ * (GL_QCOM_motion_estimation) to the
  * FrameInterpolationRenderer on the Java side.
  *
  * The vendor entry points are not part of the Android SDK/GLES headers and
@@ -11,8 +11,6 @@
  *   glTexEstimateMotionQCOM(prevLuma, currLuma, mvOut)
  *     - single-channel (R8) luma textures, block-resolution RGBA16F MV output,
  *       .xy = pos_curr - pos_prev in pixels
- *   glExtrapolateTex2DQCOM(prev, curr, out, factor)
- *     - RGBA8 frame textures, driver-internal extrapolator
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -38,10 +36,8 @@
 #define ALOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 
 typedef void (*PFNGLTEXESTIMATEMOTIONQCOMPROC)(GLuint, GLuint, GLuint);
-typedef void (*PFNGLEXTRAPOLATETEX2DQCOMPROC)(GLuint, GLuint, GLuint, GLfloat);
 
 static PFNGLTEXESTIMATEMOTIONQCOMPROC sEstimateMotion = NULL;
-static PFNGLEXTRAPOLATETEX2DQCOMPROC sExtrapolateTex2D = NULL;
 static int sResolved = 0;
 
 static void resolveExtensions(void) {
@@ -50,13 +46,11 @@ static void resolveExtensions(void) {
     }
     sResolved = 1;
     sEstimateMotion = (PFNGLTEXESTIMATEMOTIONQCOMPROC) eglGetProcAddress("glTexEstimateMotionQCOM");
-    sExtrapolateTex2D = (PFNGLEXTRAPOLATETEX2DQCOMPROC) eglGetProcAddress("glExtrapolateTex2DQCOM");
 }
 
 /*
  * Returns a bitmask of supported QCOM features:
  *   bit 0 (1) = GL_QCOM_motion_estimation usable
- *   bit 1 (2) = GL_QCOM_texture_extrapolation usable
  */
 JNIEXPORT jint JNICALL
 Java_com_limelight_utils_FrameInterpolationRenderer_nativeQueryQcomFeatures(JNIEnv *env, jclass clazz) {
@@ -70,9 +64,6 @@ Java_com_limelight_utils_FrameInterpolationRenderer_nativeQueryQcomFeatures(JNIE
     int features = 0;
     if (sEstimateMotion != NULL && strstr(ext, "GL_QCOM_motion_estimation") != NULL) {
         features |= 1;
-    }
-    if (sExtrapolateTex2D != NULL && strstr(ext, "GL_QCOM_texture_extrapolation") != NULL) {
-        features |= 2;
     }
     return features;
 }
@@ -94,27 +85,6 @@ Java_com_limelight_utils_FrameInterpolationRenderer_nativeEstimateMotion(JNIEnv 
     GLenum err = glGetError();
     if (err != GL_NO_ERROR) {
         ALOGW("glTexEstimateMotionQCOM failed, glError=0x%x", err);
-        return JNI_FALSE;
-    }
-    return JNI_TRUE;
-}
-
-/*
- * Runs the driver's black-box frame extrapolator.
- * prev/curr/out are RGBA8 frame textures, factor in [0,1].
- */
-JNIEXPORT jboolean JNICALL
-Java_com_limelight_utils_FrameInterpolationRenderer_nativeExtrapolate(JNIEnv *env, jclass clazz,
-                                                                      jint prevTex, jint currTex, jint outTex, jfloat factor) {
-    resolveExtensions();
-    if (sExtrapolateTex2D == NULL) {
-        return JNI_FALSE;
-    }
-    while (glGetError() != GL_NO_ERROR) {}
-    sExtrapolateTex2D((GLuint) prevTex, (GLuint) currTex, (GLuint) outTex, factor);
-    GLenum err = glGetError();
-    if (err != GL_NO_ERROR) {
-        ALOGW("glExtrapolateTex2DQCOM failed, glError=0x%x", err);
         return JNI_FALSE;
     }
     return JNI_TRUE;

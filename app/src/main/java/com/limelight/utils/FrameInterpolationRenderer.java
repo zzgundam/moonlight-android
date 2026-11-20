@@ -27,13 +27,10 @@ import javax.microedition.khronos.opengles.GL10;
  * presented on the display vsync grid at selectable 2x/3x/4x multipliers.
  *
  * Engine selection at surface creation:
- *   1. QCOM_ME       — Adreno hardware motion estimator (glTexEstimateMotionQCOM,
- *                      via JNI shim) feeding the bidirectional warp shader.
- *   2. QCOM_EXTRAP   — Adreno driver black-box extrapolator
- *                      (glExtrapolateTex2DQCOM) when motion estimation is
- *                      unavailable but extrapolation is.
- *   3. GLSL          — portable fallback: block-matching motion estimation
- *                      plus refinement, both in fragment shaders.
+ *   1. QCOM_ME — Adreno hardware motion estimator (glTexEstimateMotionQCOM,
+ *                via JNI shim) feeding the bidirectional warp shader.
+ *   2. GLSL    — portable fallback: block-matching motion estimation
+ *                plus refinement, both in fragment shaders.
  *
  * MV conventions (all engines): mv = pos_curr - pos_prev, in pixels.
  * A synthesized frame at phase t in (0,1) samples prev at (p - mv*t) and
@@ -69,7 +66,6 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
 
     public static final int ENGINE_NONE = 0;
     public static final int ENGINE_QCOM_ME = 1;
-    public static final int ENGINE_QCOM_EXTRAP = 2;
     public static final int ENGINE_GLSL = 3;
 
     // Public status fields (readable from overlays/debug UI)
@@ -83,6 +79,8 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     private final OnSurfaceReadyListener onSurfaceReadyListener;
     private final PreferenceConfiguration prefConfig;
     private final boolean fbcEnabled;   // user setting: backward ME / FBC occlusion check
+    private final float phaseAdvance;   // user setting: how much earlier synthetic frames claim a vsync slot
+    private final double stallThresh;   // user setting: progress beyond which the stream is treated as stalled
 
     private final FloatBuffer quadVertexBuffer;
     private final FloatBuffer textureVertexBuffer;
@@ -158,7 +156,6 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
 
     private static native int nativeQueryQcomFeatures();
     private static native boolean nativeEstimateMotion(int prevLuma, int currLuma, int mvTex);
-    private static native boolean nativeExtrapolate(int prevTex, int currTex, int outTex, float factor);
     private static native boolean nativeQueryMotionBlock(BlockParams out);
 
     public static class BlockParams {
@@ -172,6 +169,9 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         this.onSurfaceReadyListener = listener;
         this.prefConfig = prefConfig;
         this.fbcEnabled = prefConfig.frameInterpolationFbc;
+        int phaseLevel = Math.max(0, Math.min(3, prefConfig.frameInterpolationPhase));
+        this.phaseAdvance = phaseLevel * 0.10f;      // 0.0 / 0.1 / 0.2 / 0.3
+        this.stallThresh = 1.35 + phaseLevel * 0.15; // 1.35 / 1.50 / 1.65 / 1.80
         FrameInterpolationRenderer.multiplier = Math.max(2, Math.min(4, prefConfig.frameInterpolationMultiplier));
         // Seed the cadence estimate from the configured stream FPS instead of
         // assuming 60; a 30 FPS source would otherwise look "stalled" for the
@@ -250,16 +250,12 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             }
         }
 
-        synthProgram = (engine == ENGINE_QCOM_EXTRAP)
-                ? presentProgram
-                : createProgram(VERT_SHADER, SYNTH_FRAG);
+        synthProgram = createProgram(VERT_SHADER, SYNTH_FRAG);
 
-        if (engine != ENGINE_QCOM_EXTRAP) {
-            inpaintProgram = createProgram(VERT_SHADER, INPAINT_FRAG);
-            if (inpaintProgram == 0) {
-                // Occlusion inpainting is an enhancement, not a requirement.
-                LimeLog.warning("Occlusion inpaint program unavailable, using nearest-frame fallback");
-            }
+        inpaintProgram = createProgram(VERT_SHADER, INPAINT_FRAG);
+        if (inpaintProgram == 0) {
+            // Occlusion inpainting is an enhancement, not a requirement.
+            LimeLog.warning("Occlusion inpaint program unavailable, using nearest-frame fallback");
         }
 
         if (engine != ENGINE_NONE && synthProgram == 0) {
@@ -286,9 +282,6 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     private int chooseEngine() {
         if ((qcomFeatures & 1) != 0) {
             return ENGINE_QCOM_ME;
-        }
-        if ((qcomFeatures & 2) != 0) {
-            return ENGINE_QCOM_EXTRAP;
         }
         return ENGINE_GLSL;
     }
@@ -349,13 +342,17 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
                     presentReal();
                     displayFrameCount++;
                 }
-            } else if (progress > 1.35) {
+            } else if (progress > stallThresh) {
                 // Stream stalled: hold the last real frame, no synthesis.
                 presentReal();
                 displayFrameCount++;
             } else {
                 int maxSlots = multiplier - 1;
-                int targetSlots = Math.min(maxSlots, (int) Math.floor(progress * multiplier));
+                // phaseAdvance lets a synthetic frame claim its vsync slot earlier,
+                // so a jittery real-frame cadence is less likely to squeeze the
+                // in-between frame out. 0.0 keeps the original timing.
+                double effProgress = progress + phaseAdvance;
+                int targetSlots = Math.min(maxSlots, (int) Math.floor(effProgress * multiplier));
                 if (targetSlots > slotsPresented) {
                     int slot = slotsPresented + 1;
                     float phase = (float) slot / multiplier;
@@ -506,7 +503,6 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             // Refine pass: read mvTexA, write mvTexB
             renderMePass(refineProgram, mvFboB, mvTexA, frameWidth, frameHeight);
         }
-        // QCOM_EXTRAP synthesizes per-slot in presentSynthetic(); nothing here.
     }
 
     private void presentReal() {
@@ -521,23 +517,6 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         if (!glReady || !hasPrevFrame) {
             return;
         }
-        if (engine == ENGINE_QCOM_EXTRAP) {
-            // glExtrapolateTex2DQCOM expects (prev, curr, out, factor);
-            // after the swap frameTexB is prev and frameTexA is curr.
-            boolean ok = false;
-            try {
-                ok = nativeExtrapolate(frameTexB, frameTexA, getSynthTex(), phase);
-            } catch (Throwable t) {
-                LimeLog.warning("QCOM extrapolation crashed: " + t.getMessage());
-            }
-            if (ok) {
-                drawTextureToScreen(synthTex);
-            } else {
-                drawTextureToScreen(frameTexA);
-            }
-            return;
-        }
-
         if (meFailed) {
             // All HW motion passes failed for this frame pair: the MV field
             // still holds the previous pair's vectors. Hold the real frame
@@ -1005,6 +984,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             LimeLog.info("Frame interpolation: display=" + String.format("%.1f", displayFps)
                     + " source=" + String.format("%.1f", sourceFps)
                     + " engine=" + engineString() + " x" + multiplier
+                    + String.format(" phase=%.2f", phaseAdvance)
                     + (ingestCount > 0 ? String.format(" ingestAvg=%.1fms", ingestAccumNs / 1e6 / ingestCount) : ""));
             ingestAccumNs = 0;
             ingestCount = 0;
@@ -1014,7 +994,6 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     public static String engineString() {
         switch (engine) {
             case ENGINE_QCOM_ME: return "QCOM-ME";
-            case ENGINE_QCOM_EXTRAP: return "QCOM-EXTRAP";
             case ENGINE_GLSL: return "GLSL";
             default: return "OFF";
         }
@@ -1048,7 +1027,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
 
         if (glSurfaceView != null) {
             glSurfaceView.queueEvent(() -> {
-                // De-duplicate: on QCOM_EXTRAP synthProgram == presentProgram.
+                // De-duplicate program ids before deletion.
                 java.util.HashSet<Integer> seen = new java.util.HashSet<>();
                 for (int p : progSnap) {
                     if (p != 0 && seen.add(p)) {
