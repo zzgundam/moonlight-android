@@ -123,7 +123,12 @@ public class StreamContainer extends FrameLayout implements SurfaceHolder.Callba
 
     @Override
     protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
-        if (isGlRendered()) {
+        // Only the stereo 3D modes render edge-to-edge on a full-screen view.
+        // Frame interpolation renders the unmodified 2D stream, so it must be
+        // aspect-fitted exactly like the plain SurfaceView path — that keeps
+        // the view rect == video rect (no garbage letterbox bands, and touch
+        // coordinates map 1:1).
+        if (renderMode != StreamMode.MODE_2D) {
             super.onMeasure(widthMeasureSpec, heightMeasureSpec);
             return;
         }
