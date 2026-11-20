@@ -58,11 +58,11 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     private static final int MV_GRID = 8;
     private static final float MV_RANGE = 6.0f;
 
-    // Per-pixel scene-cut / occlusion gate: when the motion-compensated prev
-    // and curr samples disagree by more than this (average RGB difference,
-    // 0..1), the blend is dropped and the current frame is shown instead.
-    // Removes cross-frame ghosting on scene changes and unreliable fast motion.
-    private static final float CUT_THRESHOLD = 0.30f;
+    // Post-compensation residual gate: when the motion-compensated prev and
+    // curr samples disagree by more than this (average RGB difference, 0..1),
+    // the motion is not trustworthy (scene cut, wrong MV, occlusion) and the
+    // synthesis falls back to the nearest real frame instead of blending.
+    private static final float CUT_THRESHOLD = 0.22f;
 
     private static final long MIN_FRAME_INTERVAL_NS = 1_000_000L;
     private static final long MAX_FRAME_INTERVAL_NS = 100_000_000L;
@@ -96,25 +96,36 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     // Programs
     private int copyProgram;        // EXT_OES -> RGBA FBO
     private int lumaProgram;        // RGBA -> R8 luma
+    private int lumaHalfProgram;    // RGBA -> half-res R8 luma (4-tap box)
     private int meProgram;          // coarse block matching -> encoded MV
     private int refineProgram;      // refine around coarse MV
+    private int fuseProgram;        // multi-scale MV candidate fusion (QCOM)
+    private int smoothProgram;      // 3x3 median MV smoothing (QCOM)
     private int synthProgram;       // bidirectional warp + blend
     private int presentProgram;     // plain texture -> screen
 
     // Frame textures (swap pair)
     private int frameTexA, frameTexB;   // prev / curr color
     private int lumaTexA, lumaTexB;     // prev / curr luma (GL_R8)
+    private int lumaHalfA, lumaHalfB;   // prev / curr luma at 1/2 res (QCOM multi-scale)
     private int mvTexA, mvTexB;         // motion field ping/pong (GLSL path)
-    private int mvTexHw;                // motion field (QCOM path, RGBA16F)
-    private int frameFbo, lumaFbo, mvFboA, mvFboB;
+    private int mvTexHw;                // motion field (QCOM path, full res blocks)
+    private int mvTexHwHalf;            // motion field (QCOM path, half-res input -> 2x range)
+    private int mvRawFusedTex;          // fused candidate field (block grid)
+    private int mvSmA, mvSmB;           // smoothed field ping/pong (smCurr / smPrev)
+    private int smCurr, smPrev;
+    private int frameFbo, lumaFbo, lumaHalfFbo, mvFboA, mvFboB, fuseFbo, smoothFbo;
 
     private int frameWidth = 0, frameHeight = 0;
     private int surfaceWidth = 0, surfaceHeight = 0;
+    private int mvGridW = 0, mvGridH = 0;   // block grid of the active MV field
     private final float[] stMatrix = new float[16];
     private boolean hasPrevFrame = false;
     private boolean glReady = false;
     private int qcomFeatures = 0;
     private int mvBlockX = 16, mvBlockY = 16;
+    private volatile boolean halfScaleMe = true;   // half-res HW ME usable
+    private volatile boolean temporalPred = true;  // previous MV field usable
 
     // Cadence state
     private long lastFrameNanos = 0;
@@ -193,7 +204,19 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
 
         copyProgram = createProgram(VERT_SHADER, COPY_FRAG);
         lumaProgram = createProgram(VERT_SHADER, LUMA_FRAG);
+        lumaHalfProgram = createProgram(VERT_SHADER, LUMA_HALF_FRAG);
         presentProgram = createProgram(VERT_SHADER, PRESENT_FRAG);
+
+        if (engine == ENGINE_QCOM_ME) {
+            fuseProgram = createProgram(VERT_SHADER, FUSE_FRAG);
+            smoothProgram = createProgram(VERT_SHADER, SMOOTH_FRAG);
+            if (fuseProgram == 0 || smoothProgram == 0) {
+                // Multi-scale fusion unavailable: fall back to the raw
+                // hardware field (still correct, just a smaller search range).
+                LimeLog.warning("QCOM MV fusion programs unavailable, using raw HW field");
+                halfScaleMe = false;
+            }
+        }
 
         if (engine == ENGINE_GLSL) {
             meProgram = createProgram(VERT_SHADER, ME_FRAG);
@@ -360,9 +383,12 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             return;
         }
 
-        // Copy decoded frame into the curr texture and its luma
+        // Copy decoded frame into the curr texture and its luma pyramid
         copyExternalToTexture(videoTextureId, frameTexB, stMatrix);
         renderLuma(frameTexB, lumaTexB);
+        if (engine == ENGINE_QCOM_ME && halfScaleMe && lumaHalfProgram != 0) {
+            renderLumaHalf(frameTexB, lumaHalfB);
+        }
 
         if (hasPrevFrame) {
             runMotionEstimation();
@@ -371,6 +397,9 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         // Swap prev/curr
         int t = frameTexA; frameTexA = frameTexB; frameTexB = t;
         t = lumaTexA; lumaTexA = lumaTexB; lumaTexB = t;
+        if (engine == ENGINE_QCOM_ME && halfScaleMe) {
+            t = lumaHalfA; lumaHalfA = lumaHalfB; lumaHalfB = t;
+        }
         hasPrevFrame = true;
 
         if (lastFrameNanos != 0) {
@@ -384,13 +413,36 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
 
     private void runMotionEstimation() {
         if (engine == ENGINE_QCOM_ME) {
-            boolean ok = false;
+            boolean okFull = false;
             try {
-                ok = nativeEstimateMotion(lumaTexA, lumaTexB, mvTexHw);
+                okFull = nativeEstimateMotion(lumaTexA, lumaTexB, mvTexHw);
             } catch (Throwable t) {
                 LimeLog.warning("QCOM motion estimation crashed: " + t.getMessage());
             }
-            if (!ok) {
+
+            // Second estimator on half-resolution luma: identical hardware
+            // search window covers twice the scene motion after scaling the
+            // field back up. This is what keeps pans and fast movement inside
+            // the search range on the Adreno block estimator.
+            boolean okHalf = false;
+            if (halfScaleMe && lumaHalfProgram != 0) {
+                try {
+                    okHalf = nativeEstimateMotion(lumaHalfA, lumaHalfB, mvTexHwHalf);
+                } catch (Throwable t) {
+                    LimeLog.warning("QCOM half-res motion estimation crashed: " + t.getMessage());
+                }
+                if (!okHalf) {
+                    halfScaleMe = false;
+                    LimeLog.warning("QCOM half-res ME unavailable, search-range extension disabled");
+                }
+            }
+
+            if (okFull || okHalf) {
+                if (fuseProgram != 0 && smoothProgram != 0 && mvRawFusedTex != 0) {
+                    renderFusePass(okFull, okHalf);
+                    renderSmoothPass();
+                }
+            } else {
                 meFailed = true;
             }
         } else if (engine == ENGINE_GLSL) {
@@ -434,7 +486,9 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         int mvTex;
         float mvMode;
         if (engine == ENGINE_QCOM_ME) {
-            mvTex = mvTexHw;
+            // Prefer the fused + smoothed multi-scale field; fall back to the
+            // raw hardware field if fusion is unavailable.
+            mvTex = (fuseProgram != 0 && smCurr != 0) ? smCurr : mvTexHw;
             mvMode = 1.0f; // raw pixels in RGBA16F
         } else {
             mvTex = mvTexB; // refined field, encoded
@@ -461,8 +515,21 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         GLES20.glUniform1f(GLES20.glGetUniformLocation(synthProgram, "uMvMode"), mvMode);
         GLES20.glUniform1f(GLES20.glGetUniformLocation(synthProgram, "uMvRange"), MV_RANGE * 2.0f);
         GLES20.glUniform2f(GLES20.glGetUniformLocation(synthProgram, "uFrameSize"), frameWidth, frameHeight);
-        GLES20.glUniform1f(GLES20.glGetUniformLocation(synthProgram, "uMaxMV"), MV_RANGE * 4.0f);
+        // Magnitude sanity limit: the multi-scale (QCOM) field legitimately
+        // carries motion well beyond the GLSL search range, so scale the cap
+        // with the frame instead of clamping to the encoded-field range.
+        float maxMv = (engine == ENGINE_QCOM_ME)
+                ? Math.max(24.0f, frameWidth * 0.10f)
+                : MV_RANGE * 4.0f;
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(synthProgram, "uMaxMV"), maxMv);
         GLES20.glUniform1f(GLES20.glGetUniformLocation(synthProgram, "uCutThresh"), CUT_THRESHOLD);
+        GLES20.glUniform2f(GLES20.glGetUniformLocation(synthProgram, "uMvGrid"),
+                Math.max(1, mvGridW), Math.max(1, mvGridH));
+        // Motion-field divergence gate: discontinuities larger than ~5.5% of
+        // the frame width mark object boundaries / occlusions where a blend
+        // would produce a double silhouette.
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(synthProgram, "uDivThresh"),
+                Math.max(24.0f, frameWidth * 0.055f));
 
         // Render the synthetic frame into a texture, then present it through
         // the shared screen path (keeps viewport/letterbox handling uniform
@@ -573,6 +640,112 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
     }
 
+    /**
+     * Half-resolution luma pass used by the second hardware motion estimator.
+     * 4-tap box average to keep the downsampled luma from aliasing, which
+     * would otherwise feed false matches into the estimator.
+     */
+    private void renderLumaHalf(int srcTex, int destTex) {
+        int hw = Math.max(1, frameWidth / 2);
+        int hh = Math.max(1, frameHeight / 2);
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, lumaHalfFbo);
+        GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, destTex, 0);
+        GLES20.glViewport(0, 0, hw, hh);
+        GLES20.glUseProgram(lumaHalfProgram);
+        bindQuad(lumaHalfProgram);
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, srcTex);
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(lumaHalfProgram, "s_InputTexture"), 0);
+        GLES20.glUniform2f(GLES20.glGetUniformLocation(lumaHalfProgram, "uSrcTexel"),
+                1.0f / frameWidth, 1.0f / frameHeight);
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0);
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
+    }
+
+    /**
+     * Picks, per block, the motion candidate that matches the best among:
+     *   1. full-res hardware field,
+     *   2. half-res hardware field scaled x2 (doubles the search range),
+     *   3. previous frame's field (temporal prediction for smooth pans).
+     * Candidates are scored with a 5-tap SAD on the luma pair, so a candidate
+     * that lands on the wrong content loses regardless of its origin.
+     */
+    private void renderFusePass(boolean fullValid, boolean halfValid) {
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fuseFbo);
+        GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, mvRawFusedTex, 0);
+        GLES20.glViewport(0, 0, mvGridW, mvGridH);
+        GLES20.glUseProgram(fuseProgram);
+        bindQuad(fuseProgram);
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, lumaTexB);
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(fuseProgram, "uCurrLuma"), 0);
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE1);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, lumaTexA);
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(fuseProgram, "uPrevLuma"), 1);
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE2);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, mvTexHw);
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(fuseProgram, "uMvFull"), 2);
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE3);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, mvTexHwHalf);
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(fuseProgram, "uMvHalf"), 3);
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE4);
+        // smCurr still holds the previous frame's field at this point (the
+        // swap happens in renderSmoothPass), i.e. exactly the temporal
+        // predictor we want for smooth pans.
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, smCurr);
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(fuseProgram, "uMvPrev"), 4);
+
+        GLES20.glUniform2f(GLES20.glGetUniformLocation(fuseProgram, "uFrameSize"), frameWidth, frameHeight);
+        GLES20.glUniform2f(GLES20.glGetUniformLocation(fuseProgram, "uGridFull"), mvGridW, mvGridH);
+        GLES20.glUniform2f(GLES20.glGetUniformLocation(fuseProgram, "uBlock"), mvBlockX, mvBlockY);
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(fuseProgram, "uHalfValid"), halfValid ? 1.0f : 0.0f);
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(fuseProgram, "uFullValid"), fullValid ? 1.0f : 0.0f);
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(fuseProgram, "uPrevValid"), temporalPred ? 1.0f : 0.0f);
+
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+        for (int i = 0; i < 5; i++) {
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0 + i);
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0);
+        }
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
+    }
+
+    /**
+     * 3x3 component-wise median over the fused field: removes isolated wrong
+     * blocks that would otherwise smear a single object across the frame.
+     * The result becomes the current field; the old current field stays
+     * available as next frame's temporal predictor.
+     */
+    private void renderSmoothPass() {
+        // The other buffer holds a stale field that nothing reads, so it is
+        // reused for the new one.
+        int dst = smPrev;
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, smoothFbo);
+        GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, dst, 0);
+        GLES20.glViewport(0, 0, mvGridW, mvGridH);
+        GLES20.glUseProgram(smoothProgram);
+        bindQuad(smoothProgram);
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, mvRawFusedTex);
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(smoothProgram, "uMvRaw"), 0);
+        GLES20.glUniform2f(GLES20.glGetUniformLocation(smoothProgram, "uGrid"), mvGridW, mvGridH);
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0);
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
+
+        // New field becomes current, old current becomes the predictor.
+        int t = smPrev;
+        smPrev = smCurr;
+        smCurr = t;
+        temporalPred = true;
+    }
+
     private void allocateFrameResources() {
         frameTexA = createColorTexture(frameWidth, frameHeight);
         frameTexB = createColorTexture(frameWidth, frameHeight);
@@ -590,6 +763,8 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         if (engine == ENGINE_GLSL) {
             int mvW = (frameWidth + MV_GRID - 1) / MV_GRID;
             int mvH = (frameHeight + MV_GRID - 1) / MV_GRID;
+            mvGridW = mvW;
+            mvGridH = mvH;
             mvTexA = createColorTexture(mvW, mvH);
             mvTexB = createColorTexture(mvW, mvH);
             GLES20.glGenFramebuffers(1, fbos, 0);
@@ -608,11 +783,81 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
                 mvBlockX = params.x;
                 mvBlockY = params.y;
             }
-            mvTexHw = createRgba16fTexture(
-                    (frameWidth + mvBlockX - 1) / mvBlockX,
-                    (frameHeight + mvBlockY - 1) / mvBlockY);
-            LimeLog.info("Frame interpolation: QCOM ME block " + mvBlockX + "x" + mvBlockY);
+            mvGridW = (frameWidth + mvBlockX - 1) / mvBlockX;
+            mvGridH = (frameHeight + mvBlockY - 1) / mvBlockY;
+
+            int halfW = Math.max(1, frameWidth / 2);
+            int halfH = Math.max(1, frameHeight / 2);
+            mvTexHw = createRgba16fTexture(mvGridW, mvGridH);
+            mvTexHwHalf = createRgba16fTexture(
+                    (halfW + mvBlockX - 1) / mvBlockX,
+                    (halfH + mvBlockY - 1) / mvBlockY);
+
+            lumaHalfA = createR8Texture(halfW, halfH);
+            lumaHalfB = createR8Texture(halfW, halfH);
+            GLES20.glGenFramebuffers(1, fbos, 0);
+            lumaHalfFbo = fbos[0];
+            GLES20.glGenFramebuffers(1, fbos, 0);
+            fuseFbo = fbos[0];
+            GLES20.glGenFramebuffers(1, fbos, 0);
+            smoothFbo = fbos[0];
+
+            // Zero-init every field: mv = 0, conf = 0 -> synthesis holds the
+            // nearest real frame until a valid field exists (uninitialised
+            // RGBA16F memory would otherwise inject garbage motion).
+            clearRgba16fTexture(mvTexHw, mvGridW, mvGridH);
+            clearRgba16fTexture(mvTexHwHalf,
+                    (halfW + mvBlockX - 1) / mvBlockX,
+                    (halfH + mvBlockY - 1) / mvBlockY);
+
+            if (fuseProgram != 0 && smoothProgram != 0) {
+                mvRawFusedTex = createRgba16fTexture(mvGridW, mvGridH);
+                mvSmA = createRgba16fTexture(mvGridW, mvGridH);
+                mvSmB = createRgba16fTexture(mvGridW, mvGridH);
+                smCurr = mvSmA;
+                smPrev = mvSmB;
+
+                // RGBA16F render targets are not guaranteed on every driver
+                // (needs EXT_color_buffer_float / _half_float). Verify one
+                // attachment; if incomplete, drop fusion and use the raw
+                // hardware field with the legacy presentation path.
+                if (!isFboRenderable(mvRawFusedTex, mvGridW, mvGridH)) {
+                    LimeLog.warning("RGBA16F motion field not renderable, multi-scale fusion disabled");
+                    mvRawFusedTex = 0;
+                    mvSmA = 0;
+                    mvSmB = 0;
+                    smCurr = 0;
+                    smPrev = 0;
+                    halfScaleMe = false;
+                    temporalPred = false;
+                } else {
+                    clearRgba16fTexture(mvSmA, mvGridW, mvGridH);
+                    clearRgba16fTexture(mvSmB, mvGridW, mvGridH);
+                    temporalPred = false;
+                }
+            }
+            LimeLog.info("Frame interpolation: QCOM ME block " + mvBlockX + "x" + mvBlockY
+                    + ", grid " + mvGridW + "x" + mvGridH + ", multiscale="
+                    + (mvRawFusedTex != 0));
         }
+    }
+
+    private boolean isFboRenderable(int tex, int w, int h) {
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fuseFbo);
+        GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, tex, 0);
+        GLES20.glViewport(0, 0, w, h);
+        int status = GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER);
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
+        return status == GLES20.GL_FRAMEBUFFER_COMPLETE;
+    }
+
+    private void clearRgba16fTexture(int tex, int w, int h) {
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, smoothFbo);
+        GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, tex, 0);
+        GLES20.glViewport(0, 0, w, h);
+        GLES20.glClearColor(0f, 0f, 0f, 0f);
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
     }
 
     private void updateFps(long now) {
@@ -667,7 +912,8 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
                     }
                 }
                 int[] textures = {videoTextureId, frameTexA, frameTexB, lumaTexA, lumaTexB,
-                        mvTexA, mvTexB, mvTexHw, synthTex};
+                        lumaHalfA, lumaHalfB, mvTexA, mvTexB, mvTexHw, mvTexHwHalf,
+                        mvRawFusedTex, mvSmA, mvSmB, synthTex};
                 int count = 0;
                 int[] compact = new int[textures.length];
                 for (int t : textures) {
@@ -676,7 +922,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
                 if (count > 0) {
                     GLES20.glDeleteTextures(count, compact, 0);
                 }
-                int[] fbos = {frameFbo, lumaFbo, synthFbo, mvFboA, mvFboB};
+                int[] fbos = {frameFbo, lumaFbo, lumaHalfFbo, synthFbo, mvFboA, mvFboB, fuseFbo, smoothFbo};
                 int fCount = 0;
                 int[] fCompact = new int[fbos.length];
                 for (int f : fbos) {
@@ -699,6 +945,11 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         engine = ENGINE_NONE;
         displayFps = 0;
         sourceFps = 0;
+        mvGridW = 0;
+        mvGridH = 0;
+        smCurr = 0;
+        smPrev = 0;
+        temporalPred = false;
     }
 
     // ─── GL helpers ──────────────────────────────────────────────────────────
@@ -830,6 +1081,115 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             "    outColor = vec4(l, 0.0, 0.0, 1.0);\n" +
             "}\n";
 
+    // Half-res luma for the second (range-extended) hardware estimator.
+    // 4-tap box average keeps the downsample from aliasing, which would feed
+    // false matches into the estimator.
+    private static final String LUMA_HALF_FRAG =
+            "#version 300 es\n" +
+            "precision mediump float;\n" +
+            "uniform mediump sampler2D s_InputTexture;\n" +
+            "uniform vec2 uSrcTexel;\n" +
+            "in vec2 vUV;\n" +
+            "out vec4 outColor;\n" +
+            "void main() {\n" +
+            "    vec3 c = texture(s_InputTexture, vUV + vec2(-0.5, -0.5) * uSrcTexel).rgb;\n" +
+            "    c += texture(s_InputTexture, vUV + vec2(0.5, -0.5) * uSrcTexel).rgb;\n" +
+            "    c += texture(s_InputTexture, vUV + vec2(-0.5, 0.5) * uSrcTexel).rgb;\n" +
+            "    c += texture(s_InputTexture, vUV + vec2(0.5, 0.5) * uSrcTexel).rgb;\n" +
+            "    c *= 0.25;\n" +
+            "    float l = 0.299 * c.r + 0.587 * c.g + 0.114 * c.b;\n" +
+            "    outColor = vec4(l, 0.0, 0.0, 1.0);\n" +
+            "}\n";
+
+    // Multi-scale candidate fusion (QCOM path), one fragment per ME block.
+    // Candidates: full-res field, half-res field x2, previous frame's field.
+    // Each is scored with a 5-tap SAD on the luma pair at the block centre;
+    // the winner's score becomes the confidence. A candidate that lands on
+    // the wrong content loses no matter where it came from, so a bad
+    // half-res match can never replace a good full-res one.
+    private static final String FUSE_FRAG =
+            "#version 300 es\n" +
+            "precision highp float;\n" +
+            "uniform mediump sampler2D uCurrLuma;\n" +
+            "uniform mediump sampler2D uPrevLuma;\n" +
+            "uniform highp sampler2D uMvFull;\n" +
+            "uniform highp sampler2D uMvHalf;\n" +
+            "uniform highp sampler2D uMvPrev;\n" +
+            "uniform vec2 uFrameSize;\n" +
+            "uniform vec2 uGridFull;\n" +
+            "uniform vec2 uBlock;\n" +
+            "uniform float uFullValid;\n" +
+            "uniform float uHalfValid;\n" +
+            "uniform float uPrevValid;\n" +
+            "in vec2 vUV;\n" +
+            "out vec4 outColor;\n" +
+            "\n" +
+            "float tapDiff(vec2 curPx, vec2 mv) {\n" +
+            "    vec2 cc = clamp(curPx / uFrameSize, vec2(0.0), vec2(1.0));\n" +
+            "    vec2 pc = clamp((curPx - mv) / uFrameSize, vec2(0.0), vec2(1.0));\n" +
+            "    return abs(texture(uCurrLuma, cc).r - texture(uPrevLuma, pc).r);\n" +
+            "}\n" +
+            "\n" +
+            "float sad5(vec2 c, vec2 mv) {\n" +
+            "    vec2 q = uBlock * 0.35;\n" +
+            "    return tapDiff(c, mv)\n" +
+            "         + tapDiff(c + vec2(q.x, 0.0), mv)\n" +
+            "         + tapDiff(c - vec2(q.x, 0.0), mv)\n" +
+            "         + tapDiff(c + vec2(0.0, q.y), mv)\n" +
+            "         + tapDiff(c - vec2(0.0, q.y), mv);\n" +
+            "}\n" +
+            "\n" +
+            "void main() {\n" +
+            "    vec2 blockUv = (floor(vUV * uGridFull) + 0.5) / uGridFull;\n" +
+            "    vec2 centerPx = blockUv * uFrameSize;\n" +
+            "\n" +
+            "    vec2 mvFull = texture(uMvFull, vUV).rg;\n" +
+            "    vec2 mvHalf = texture(uMvHalf, vUV).rg * 2.0;\n" +
+            "    vec2 mvPrev = texture(uMvPrev, vUV).rg;\n" +
+            "\n" +
+            "    float sFull = (uFullValid > 0.5) ? sad5(centerPx, mvFull) : 1e6;\n" +
+            "    float sHalf = (uHalfValid > 0.5) ? sad5(centerPx, mvHalf) : 1e6;\n" +
+            "    float sPrev = (uPrevValid > 0.5) ? sad5(centerPx, mvPrev) : 1e6;\n" +
+            "\n" +
+            "    float best = sFull;\n" +
+            "    vec2 bestMv = mvFull;\n" +
+            "    if (sHalf < best) { best = sHalf; bestMv = mvHalf; }\n" +
+            "    if (sPrev < best) { best = sPrev; bestMv = mvPrev; }\n" +
+            "\n" +
+            "    // 5 taps, ~0.15 luma tolerance each.\n" +
+            "    float conf = clamp(1.0 - best / 0.75, 0.0, 1.0);\n" +
+            "    outColor = vec4(bestMv, conf, 1.0);\n" +
+            "}\n";
+
+    // 3x3 component-wise median over the fused field: kills isolated wrong
+    // blocks that would otherwise smear one object across the frame.
+    private static final String SMOOTH_FRAG =
+            "#version 300 es\n" +
+            "precision highp float;\n" +
+            "uniform highp sampler2D uMvRaw;\n" +
+            "uniform vec2 uGrid;\n" +
+            "in vec2 vUV;\n" +
+            "out vec4 outColor;\n" +
+            "\n" +
+            "vec2 samp(vec2 uv) {\n" +
+            "    return texture(uMvRaw, clamp(uv, 0.5 / uGrid, 1.0 - 0.5 / uGrid)).rg;\n" +
+            "}\n" +
+            "float med3(float a, float b, float c) {\n" +
+            "    return max(min(a, b), min(max(a, b), c));\n" +
+            "}\n" +
+            "vec2 med3v(vec2 a, vec2 b, vec2 c) {\n" +
+            "    return vec2(med3(a.x, b.x, c.x), med3(a.y, b.y, c.y));\n" +
+            "}\n" +
+            "\n" +
+            "void main() {\n" +
+            "    vec2 t = 1.0 / uGrid;\n" +
+            "    vec2 r0 = med3v(samp(vUV + vec2(-t.x, -t.y)), samp(vUV + vec2(0.0, -t.y)), samp(vUV + vec2(t.x, -t.y)));\n" +
+            "    vec2 r1 = med3v(samp(vUV + vec2(-t.x, 0.0)), samp(vUV), samp(vUV + vec2(t.x, 0.0)));\n" +
+            "    vec2 r2 = med3v(samp(vUV + vec2(-t.x, t.y)), samp(vUV + vec2(0.0, t.y)), samp(vUV + vec2(t.x, t.y)));\n" +
+            "    vec2 m = med3v(r0, r1, r2);\n" +
+            "    outColor = vec4(m, texture(uMvRaw, vUV).b, 1.0);\n" +
+            "}\n";
+
     private static final String PRESENT_FRAG =
             "#version 300 es\n" +
             "precision mediump float;\n" +
@@ -940,8 +1300,14 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             "    outColor = vec4(enc, conf, 1.0);\n" +
             "}\n";
 
-    // Bidirectional synthesis. uPhase in (0,1): 0 = prev, 1 = curr.
+    // Bidirectional synthesis with validity gating.
+    // uPhase in (0,1): 0 = prev, 1 = curr.
     // uMvMode 0: encoded RGBA8 field (GLSL path); 1: raw pixels in RGBA16F (QCOM).
+    //
+    // The warped prev/curr samples are only blended where the motion is
+    // trustworthy (confidence, post-compensation residual, MV-field
+    // divergence). Everywhere else the nearest real frame is held, which is
+    // what prevents a moving object from appearing twice.
     private static final String SYNTH_FRAG =
             "#version 300 es\n" +
             "precision highp float;\n" +
@@ -954,19 +1320,38 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             "uniform vec2 uFrameSize;\n" +
             "uniform float uMaxMV;\n" +
             "uniform float uCutThresh;\n" +
+            "uniform vec2 uMvGrid;\n" +
+            "uniform float uDivThresh;\n" +
             "in vec2 vUV;\n" +
             "out vec4 outColor;\n" +
             "\n" +
+            "vec2 decodeMv(vec2 raw) {\n" +
+            "    return mix((raw - 0.5) * uMvRange, raw, uMvMode);\n" +
+            "}\n" +
+            "\n" +
             "void main() {\n" +
             "    vec4 m = texture(uMV, vUV);\n" +
-            "    vec2 mvPx = mix((m.rg - 0.5) * uMvRange, m.rg, uMvMode);\n" +
-            "    float conf = clamp(m.b, 0.0, 1.0);\n" +
+            "    vec2 mvPx = decodeMv(m.rg);\n" +
+            "    float conf = m.b;\n" +
             "\n" +
-            "    float len = length(mvPx);\n" +
-            "    if (len > uMaxMV) {\n" +
+            "    // Uninitialised / NaN fields must degrade to 'no motion'.\n" +
+            "    if (isnan(mvPx.x) || isnan(mvPx.y)) mvPx = vec2(0.0);\n" +
+            "    if (isnan(conf)) conf = 0.0;\n" +
+            "    conf = clamp(conf, 0.0, 1.0);\n" +
+            "\n" +
+            "    if (length(mvPx) > uMaxMV) {\n" +
             "        mvPx = vec2(0.0);\n" +
             "        conf = 0.0;\n" +
             "    }\n" +
+            "\n" +
+            "    // MV-field divergence: a jump against the neighbours marks an\n" +
+            "    // object boundary / occlusion, where any blend would ghost.\n" +
+            "    vec2 t = 1.0 / uMvGrid;\n" +
+            "    vec2 mR = decodeMv(texture(uMV, vUV + vec2(t.x, 0.0)).rg);\n" +
+            "    vec2 mL = decodeMv(texture(uMV, vUV - vec2(t.x, 0.0)).rg);\n" +
+            "    vec2 mU = decodeMv(texture(uMV, vUV + vec2(0.0, t.y)).rg);\n" +
+            "    vec2 mD = decodeMv(texture(uMV, vUV - vec2(0.0, t.y)).rg);\n" +
+            "    float div = length(mR - mL) + length(mU - mD);\n" +
             "\n" +
             "    vec2 mvUv = mvPx / uFrameSize;\n" +
             "    vec2 prevUv = vUV - mvUv * uPhase;\n" +
@@ -979,18 +1364,17 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             "    vec4 cPrev = texture(uPrev, pc);\n" +
             "    vec4 cCurr = texture(uCurr, cc);\n" +
             "\n" +
-            "    vec4 blended = mix(cPrev, cCurr, uPhase);\n" +
-            "    vec4 fallback = mix(cCurr, blended, 0.5 * uPhase);\n" +
-            "    vec4 result = mix(fallback, blended, conf);\n" +
-            "    result = mix(result, cCurr, outside * (1.0 - uPhase * 0.5));\n" +
+            "    // Residual after motion compensation: do both frames agree here?\n" +
+            "    float res = dot(abs(cPrev.rgb - cCurr.rgb), vec3(0.3333));\n" +
             "\n" +
-            "    // Scene-cut / occlusion gate: after motion compensation the two\n" +
-            "    // samples should agree for real motion. A large residual means a\n" +
-            "    // scene change or a wrong MV — blending would produce ghosting,\n" +
-            "    // so show the current frame instead.\n" +
-            "    float residual = dot(abs(cPrev.rgb - cCurr.rgb), vec3(0.3333));\n" +
-            "    float cut = smoothstep(uCutThresh, uCutThresh * 1.5, residual);\n" +
-            "    outColor = mix(result, cCurr, cut);\n" +
+            "    float vConf = smoothstep(0.05, 0.35, conf);\n" +
+            "    float vRes  = 1.0 - smoothstep(uCutThresh, uCutThresh + 0.18, res);\n" +
+            "    float vDiv  = 1.0 - smoothstep(uDivThresh, uDivThresh * 1.8, div);\n" +
+            "    float valid = vConf * vRes * vDiv * (1.0 - outside);\n" +
+            "\n" +
+            "    vec4 synth = mix(cPrev, cCurr, uPhase);\n" +
+            "    vec4 nearest = (uPhase < 0.5) ? cPrev : cCurr;\n" +
+            "    outColor = mix(nearest, synth, valid);\n" +
             "}\n";
 
     // ─── Imports that need no ambiguity ─────────────────────────────────────
