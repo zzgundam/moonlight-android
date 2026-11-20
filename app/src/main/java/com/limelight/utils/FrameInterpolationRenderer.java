@@ -67,6 +67,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     public static final int ENGINE_GLSL = 3;
 
     // Public status fields (readable from overlays/debug UI)
+    public static volatile boolean isActive = false;
     public static volatile int engine = ENGINE_NONE;
     public static volatile int multiplier = 2;
     public static volatile float displayFps = 0;
@@ -204,6 +205,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         }
 
         glReady = engine != ENGINE_NONE;
+        isActive = glReady;
 
         if (engine != ENGINE_NONE && copyProgram == 0) {
             // Without the OES copy pass nothing can be displayed correctly.
@@ -235,10 +237,12 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     }
 
     /**
-     * Set the viewport for drawing to the screen (default framebuffer):
-     * the stream frame letterboxed and centered inside the full surface.
-     * Every screen draw must call this — FBO passes leave a different
-     * viewport behind (this was the cause of the "garbage top strip").
+     * Set the viewport for drawing to the screen (default framebuffer).
+     * StreamContainer aspect-fits the GLSurfaceView to the video, so the
+     * frame stretches to the full view exactly like the plain 2D SurfaceView
+     * path (including fillDisplay/zoom). Every screen draw must call this —
+     * FBO passes leave a different viewport behind, and unstretched regions
+     * of the back buffer would show garbage.
      */
     private void applyScreenViewport() {
         int sw = surfaceWidth > 0 ? surfaceWidth : glSurfaceView.getWidth();
@@ -246,16 +250,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         if (sw <= 0 || sh <= 0) {
             return;
         }
-        int vw, vh;
-        if (frameWidth > 0 && frameHeight > 0) {
-            float scale = Math.min((float) sw / frameWidth, (float) sh / frameHeight);
-            vw = Math.max(1, Math.round(frameWidth * scale));
-            vh = Math.max(1, Math.round(frameHeight * scale));
-        } else {
-            vw = sw;
-            vh = sh;
-        }
-        GLES20.glViewport((sw - vw) / 2, (sh - vh) / 2, vw, vh);
+        GLES20.glViewport(0, 0, sw, sh);
     }
 
     @Override
@@ -661,6 +656,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             });
         }
         glReady = false;
+        isActive = false;
         hasPrevFrame = false;
         frameWidth = 0;
         frameHeight = 0;
