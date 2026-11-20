@@ -102,6 +102,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     private int frameFbo, lumaFbo, mvFboA, mvFboB;
 
     private int frameWidth = 0, frameHeight = 0;
+    private int surfaceWidth = 0, surfaceHeight = 0;
     private final float[] stMatrix = new float[16];
     private boolean hasPrevFrame = false;
     private boolean glReady = false;
@@ -228,7 +229,33 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
 
     @Override
     public void onSurfaceChanged(GL10 gl, int width, int height) {
-        GLES20.glViewport(0, 0, width, height);
+        surfaceWidth = width;
+        surfaceHeight = height;
+        applyScreenViewport();
+    }
+
+    /**
+     * Set the viewport for drawing to the screen (default framebuffer):
+     * the stream frame letterboxed and centered inside the full surface.
+     * Every screen draw must call this — FBO passes leave a different
+     * viewport behind (this was the cause of the "garbage top strip").
+     */
+    private void applyScreenViewport() {
+        int sw = surfaceWidth > 0 ? surfaceWidth : glSurfaceView.getWidth();
+        int sh = surfaceHeight > 0 ? surfaceHeight : glSurfaceView.getHeight();
+        if (sw <= 0 || sh <= 0) {
+            return;
+        }
+        int vw, vh;
+        if (frameWidth > 0 && frameHeight > 0) {
+            float scale = Math.min((float) sw / frameWidth, (float) sh / frameHeight);
+            vw = Math.max(1, Math.round(frameWidth * scale));
+            vh = Math.max(1, Math.round(frameHeight * scale));
+        } else {
+            vw = sw;
+            vh = sh;
+        }
+        GLES20.glViewport((sw - vw) / 2, (sh - vh) / 2, vw, vh);
     }
 
     @Override
@@ -269,6 +296,10 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
                 presentSynthetic(phase, now);
                 slotsPresented = slot;
                 displayFrameCount++;
+            } else {
+                // No new slot this vsync: re-present the last frame so the
+                // back buffer always holds valid content (never uninitialized).
+                drawTextureToScreen(lastScreenTex);
             }
         }
 
@@ -409,11 +440,23 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         GLES20.glUniform2f(GLES20.glGetUniformLocation(synthProgram, "uFrameSize"), frameWidth, frameHeight);
         GLES20.glUniform1f(GLES20.glGetUniformLocation(synthProgram, "uMaxMV"), MV_RANGE * 4.0f);
 
+        // Render the synthetic frame into a texture, then present it through
+        // the shared screen path (keeps viewport/letterbox handling uniform
+        // and gives every vsync a valid back buffer).
+        int outTex = getSynthTex();
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, synthFbo);
+        GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, outTex, 0);
+        GLES20.glViewport(0, 0, frameWidth, frameHeight);
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0);
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
+
+        drawTextureToScreen(outTex);
     }
 
     private int synthTex = 0;
+    private int synthFbo = 0;
+    private int lastScreenTex = 0;
 
     private int getSynthTex() {
         if (synthTex == 0) {
@@ -423,6 +466,11 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     }
 
     private void drawTextureToScreen(int tex) {
+        if (tex == 0) {
+            return;
+        }
+        applyScreenViewport();
+        lastScreenTex = tex;
         GLES20.glUseProgram(presentProgram);
         bindQuad(presentProgram);
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
@@ -512,6 +560,8 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         frameFbo = fbos[0];
         GLES20.glGenFramebuffers(1, fbos, 0);
         lumaFbo = fbos[0];
+        GLES20.glGenFramebuffers(1, fbos, 0);
+        synthFbo = fbos[0];
 
         if (engine == ENGINE_GLSL) {
             int mvW = (frameWidth + MV_GRID - 1) / MV_GRID;
@@ -599,7 +649,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
                 if (count > 0) {
                     GLES20.glDeleteTextures(count, compact, 0);
                 }
-                int[] fbos = {frameFbo, lumaFbo, mvFboA, mvFboB};
+                int[] fbos = {frameFbo, lumaFbo, synthFbo, mvFboA, mvFboB};
                 int fCount = 0;
                 int[] fCompact = new int[fbos.length];
                 for (int f : fbos) {
@@ -614,6 +664,9 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         hasPrevFrame = false;
         frameWidth = 0;
         frameHeight = 0;
+        surfaceWidth = 0;
+        surfaceHeight = 0;
+        lastScreenTex = 0;
         lastFrameNanos = 0;
         engine = ENGINE_NONE;
         displayFps = 0;
