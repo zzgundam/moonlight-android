@@ -914,6 +914,23 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
                     float targetFps = (prefConfig != null && prefConfig.fps > 0) ? prefConfig.fps : displayHz;
 
+                    // When frame interpolation is enabled, the displayed content rate is
+                    // fps x multiplier (synthetic + real frames), NOT the raw stream fps.
+                    // Voting the stream fps here (FIXED_SOURCE) pins a 120 Hz panel to
+                    // 60 Hz and leaves no vsync slots for synthetic frames, so vote the
+                    // interpolated rate with DEFAULT compatibility instead. The clamp
+                    // against displayHz is skipped for interpolation: the panel may
+                    // already have been switched down by an earlier vote, and
+                    // Surface.setFrameRate safely caps itself at the panel max.
+                    boolean interpActive = prefConfig != null && prefConfig.frameInterpolation;
+                    if (interpActive) {
+                        int mult = prefConfig.frameInterpolationMultiplier;
+                        if (mult < 2 || mult > 4) {
+                            mult = 2;
+                        }
+                        targetFps = (prefConfig.fps > 0 ? prefConfig.fps : 60) * (float) mult;
+                    }
+
                     boolean isMTKDevice;
                     try {
                         String sum = (android.os.Build.MANUFACTURER + " " + android.os.Build.HARDWARE + " " + android.os.Build.BOARD)
@@ -927,7 +944,9 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
                     try {
                         java.lang.reflect.Method m = SurfaceView.class.getMethod("setFrameRate", float.class, int.class);
-                        m.invoke(streamSurfaceView, Math.min(targetFps, displayHz), compat);
+                        float voteRate = interpActive ? targetFps : Math.min(targetFps, displayHz);
+                        int voteCompat = interpActive ? Surface.FRAME_RATE_COMPATIBILITY_DEFAULT : compat;
+                        m.invoke(streamSurfaceView, voteRate, voteCompat);
                     } catch (Throwable ignored) {}
                 }
             }
