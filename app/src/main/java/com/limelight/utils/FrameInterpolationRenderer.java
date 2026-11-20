@@ -103,6 +103,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     private int smoothProgram;      // 3x3 median MV smoothing (QCOM)
     private int synthProgram;       // bidirectional warp + blend
     private int presentProgram;     // plain texture -> screen
+    private int inpaintProgram;     // fill invalid (occluded) pixels from valid neighbours
 
     // Frame textures (swap pair)
     private int frameTexA, frameTexB;   // prev / curr color
@@ -111,6 +112,8 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     private int mvTexA, mvTexB;         // motion field ping/pong (GLSL path)
     private int mvTexHw;                // motion field (QCOM path, full res blocks)
     private int mvTexHwHalf;            // motion field (QCOM path, half-res input -> 2x range)
+    private int mvTexBwd;               // backward motion field (QCOM FBC)
+    private int mvBwdSm;                // smoothed backward field (QCOM FBC)
     private int mvRawFusedTex;          // fused candidate field (block grid)
     private int mvSmA, mvSmB;           // smoothed field ping/pong (smCurr / smPrev)
     private int smCurr, smPrev;
@@ -232,6 +235,14 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         synthProgram = (engine == ENGINE_QCOM_EXTRAP)
                 ? presentProgram
                 : createProgram(VERT_SHADER, SYNTH_FRAG);
+
+        if (engine != ENGINE_QCOM_EXTRAP) {
+            inpaintProgram = createProgram(VERT_SHADER, INPAINT_FRAG);
+            if (inpaintProgram == 0) {
+                // Occlusion inpainting is an enhancement, not a requirement.
+                LimeLog.warning("Occlusion inpaint program unavailable, using nearest-frame fallback");
+            }
+        }
 
         if (engine != ENGINE_NONE && synthProgram == 0) {
             LimeLog.severe("Frame interpolation: synthesis program failed to compile, interpolation disabled");
@@ -789,24 +800,32 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         // The other buffer holds a stale field that nothing reads, so it is
         // reused for the new one.
         int dst = smPrev;
-        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, smoothFbo);
-        GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, dst, 0);
-        GLES20.glViewport(0, 0, mvGridW, mvGridH);
-        GLES20.glUseProgram(smoothProgram);
-        bindQuad(smoothProgram);
-        GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, mvRawFusedTex);
-        GLES20.glUniform1i(GLES20.glGetUniformLocation(smoothProgram, "uMvRaw"), 0);
-        GLES20.glUniform2f(GLES20.glGetUniformLocation(smoothProgram, "uGrid"), mvGridW, mvGridH);
-        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0);
-        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
+        renderSmoothField(mvRawFusedTex, dst);
 
         // New field becomes current, old current becomes the predictor.
         int t = smPrev;
         smPrev = smCurr;
         smCurr = t;
         temporalPred = true;
+    }
+
+    /**
+     * 3x3 median smoothing of any block-grid MV field. Shared by the forward
+     * fused field and the backward (consistency) field.
+     */
+    private void renderSmoothField(int srcTex, int dstTex) {
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, smoothFbo);
+        GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, dstTex, 0);
+        GLES20.glViewport(0, 0, mvGridW, mvGridH);
+        GLES20.glUseProgram(smoothProgram);
+        bindQuad(smoothProgram);
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, srcTex);
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(smoothProgram, "uMvRaw"), 0);
+        GLES20.glUniform2f(GLES20.glGetUniformLocation(smoothProgram, "uGrid"), mvGridW, mvGridH);
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0);
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
     }
 
     private void allocateFrameResources() {
