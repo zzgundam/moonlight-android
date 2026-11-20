@@ -126,6 +126,8 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     private int mvBlockX = 16, mvBlockY = 16;
     private volatile boolean halfScaleMe = true;   // half-res HW ME usable
     private volatile boolean temporalPred = true;  // previous MV field usable
+    private volatile boolean bwdFieldValid = false; // backward field (FBC) usable
+    private float fbcThresh = 6.0f;                 // fwd+bwd disagreement cap (px)
 
     // Cadence state
     private long lastFrameNanos = 0;
@@ -442,8 +444,27 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
                     renderFusePass(okFull, okHalf);
                     renderSmoothPass();
                 }
+
+                // Backward field (curr -> prev) for forward-backward motion
+                // consistency in the synthesis shader. A pixel is only
+                // interpolated when the forward MV at its position and the
+                // backward MV at the warped position agree (fwd + bwd ~ 0);
+                // disagreement marks occlusion, where blending would ghost.
+                boolean okBwd = false;
+                try {
+                    okBwd = nativeEstimateMotion(lumaTexB, lumaTexA, mvTexBwd);
+                } catch (Throwable t) {
+                    LimeLog.warning("QCOM backward motion estimation crashed: " + t.getMessage());
+                }
+                if (okBwd && mvBwdSm != 0) {
+                    renderSmoothField(mvTexBwd, mvBwdSm);
+                    bwdFieldValid = true;
+                } else {
+                    bwdFieldValid = false;
+                }
             } else {
                 meFailed = true;
+                bwdFieldValid = false;
             }
         } else if (engine == ENGINE_GLSL) {
             // Coarse pass: prevMV (mvTexA) untouched this frame -> render into mvTexA
@@ -531,6 +552,15 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         GLES20.glUniform1f(GLES20.glGetUniformLocation(synthProgram, "uDivThresh"),
                 Math.max(24.0f, frameWidth * 0.055f));
 
+        // Backward motion field for forward-backward consistency (QCOM only;
+        // the GLSL engine has no backward field and keeps its residual gates).
+        boolean fbc = (engine == ENGINE_QCOM_ME) && bwdFieldValid && mvBwdSm != 0;
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE3);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fbc ? mvBwdSm : frameTexA);
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(synthProgram, "uMvBwd"), 3);
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(synthProgram, "uFbcValid"), fbc ? 1.0f : 0.0f);
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(synthProgram, "uFbcThresh"), fbcThresh);
+
         // Render the synthetic frame into a texture, then present it through
         // the shared screen path (keeps viewport/letterbox handling uniform
         // and gives every vsync a valid back buffer).
@@ -539,13 +569,39 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, outTex, 0);
         GLES20.glViewport(0, 0, frameWidth, frameHeight);
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0);
+        for (int i = 0; i < 4; i++) {
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0 + i);
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0);
+        }
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
+
+        // Occlusion inpaint: the synthesis pass writes its per-pixel validity
+        // into alpha; this pass fills fully-invalid pixels (disocclusions,
+        // frame borders) with a validity-weighted average of the surrounding
+        // valid pixels instead of leaving hard nearest-frame seams.
+        if (inpaintProgram != 0) {
+            int inTex = outTex;
+            outTex = getSynthTex2();
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, synthFbo);
+            GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, outTex, 0);
+            GLES20.glViewport(0, 0, frameWidth, frameHeight);
+            GLES20.glUseProgram(inpaintProgram);
+            bindQuad(inpaintProgram);
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, inTex);
+            GLES20.glUniform1i(GLES20.glGetUniformLocation(inpaintProgram, "uSrc"), 0);
+            GLES20.glUniform2f(GLES20.glGetUniformLocation(inpaintProgram, "uTexel"),
+                    1.0f / frameWidth, 1.0f / frameHeight);
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0);
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
+        }
 
         drawTextureToScreen(outTex);
     }
 
     private int synthTex = 0;
+    private int synthTex2 = 0;
     private int synthFbo = 0;
     private int lastScreenTex = 0;
 
@@ -554,6 +610,13 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             synthTex = createColorTexture(frameWidth, frameHeight);
         }
         return synthTex;
+    }
+
+    private int getSynthTex2() {
+        if (synthTex2 == 0) {
+            synthTex2 = createColorTexture(frameWidth, frameHeight);
+        }
+        return synthTex2;
     }
 
     private void drawTextureToScreen(int tex) {
@@ -792,6 +855,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             mvTexHwHalf = createRgba16fTexture(
                     (halfW + mvBlockX - 1) / mvBlockX,
                     (halfH + mvBlockY - 1) / mvBlockY);
+            mvTexBwd = createRgba16fTexture(mvGridW, mvGridH);
 
             lumaHalfA = createR8Texture(halfW, halfH);
             lumaHalfB = createR8Texture(halfW, halfH);
@@ -809,6 +873,18 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             clearRgba16fTexture(mvTexHwHalf,
                     (halfW + mvBlockX - 1) / mvBlockX,
                     (halfH + mvBlockY - 1) / mvBlockY);
+
+            if (isFboRenderable(mvTexBwd, mvGridW, mvGridH)) {
+                mvBwdSm = createRgba16fTexture(mvGridW, mvGridH);
+                clearRgba16fTexture(mvBwdSm, mvGridW, mvGridH);
+                // Consistency tolerance scales with the block size: fields are
+                // block-quantised, so even perfect motion disagrees by up to
+                // ~half a block between the two directions.
+                fbcThresh = Math.max(6.0f, Math.max(mvBlockX, mvBlockY) * 0.45f);
+            } else {
+                mvBwdSm = 0;
+                bwdFieldValid = false;
+            }
 
             if (fuseProgram != 0 && smoothProgram != 0) {
                 mvRawFusedTex = createRgba16fTexture(mvGridW, mvGridH);
@@ -949,6 +1025,8 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         mvGridH = 0;
         smCurr = 0;
         smPrev = 0;
+        synthTex2 = 0;
+        bwdFieldValid = false;
         temporalPred = false;
     }
 
@@ -1305,15 +1383,24 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     // uMvMode 0: encoded RGBA8 field (GLSL path); 1: raw pixels in RGBA16F (QCOM).
     //
     // The warped prev/curr samples are only blended where the motion is
-    // trustworthy (confidence, post-compensation residual, MV-field
-    // divergence). Everywhere else the nearest real frame is held, which is
-    // what prevents a moving object from appearing twice.
+    // trustworthy, verified by four independent gates:
+    //   1. estimator confidence,
+    //   2. post-compensation residual between the warped samples,
+    //   3. MV-field divergence (object boundaries),
+    //   4. forward-backward consistency: the forward MV here and the backward
+    //      MV at the warped position must agree (fwd + bwd ~ 0); disagreement
+    //      is the classic disocclusion signature (FSR3-style check).
+    // Pixels identical in both real frames (HUD, crosshair, letterboxed
+    // background) bypass motion entirely and copy the current frame, so the
+    // estimator can never warp static UI. Per-pixel validity is written to
+    // alpha for the occlusion inpaint pass.
     private static final String SYNTH_FRAG =
             "#version 300 es\n" +
             "precision highp float;\n" +
             "uniform mediump sampler2D uCurr;\n" +
             "uniform mediump sampler2D uPrev;\n" +
             "uniform highp sampler2D uMV;\n" +
+            "uniform highp sampler2D uMvBwd;\n" +
             "uniform float uPhase;\n" +
             "uniform float uMvMode;\n" +
             "uniform float uMvRange;\n" +
@@ -1322,6 +1409,8 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             "uniform float uCutThresh;\n" +
             "uniform vec2 uMvGrid;\n" +
             "uniform float uDivThresh;\n" +
+            "uniform float uFbcValid;\n" +
+            "uniform float uFbcThresh;\n" +
             "in vec2 vUV;\n" +
             "out vec4 outColor;\n" +
             "\n" +
@@ -1372,9 +1461,69 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             "    float vDiv  = 1.0 - smoothstep(uDivThresh, uDivThresh * 1.8, div);\n" +
             "    float valid = vConf * vRes * vDiv * (1.0 - outside);\n" +
             "\n" +
+            "    // Forward-backward consistency: at a consistent surface the\n" +
+            "    // forward vector into curr and the backward vector out of curr\n" +
+            "    // cancel. A mismatch means one side of the pair is hidden there\n" +
+            "    // (occlusion) and any blend would place content twice.\n" +
+            "    if (uFbcValid > 0.5) {\n" +
+            "        vec2 mvBwd = texture(uMvBwd, cc).rg;\n" +
+            "        if (isnan(mvBwd.x) || isnan(mvBwd.y)) mvBwd = vec2(0.0);\n" +
+            "        float fbc = length(mvPx + mvBwd);\n" +
+            "        valid *= 1.0 - smoothstep(uFbcThresh, uFbcThresh * 2.0, fbc);\n" +
+            "    }\n" +
+            "\n" +
             "    vec4 synth = mix(cPrev, cCurr, uPhase);\n" +
             "    vec4 nearest = (uPhase < 0.5) ? cPrev : cCurr;\n" +
-            "    outColor = mix(nearest, synth, valid);\n" +
+            "    vec4 outc = mix(nearest, synth, valid);\n" +
+            "\n" +
+            "    // Static-pixel / HUD protection: content identical in both real\n" +
+            "    // frames is copied from curr without any motion. Codec noise\n" +
+            "    // keeps this from firing on normal video, but game overlays,\n" +
+            "    // crosshairs and scoreboards are rock-stable and must never be\n" +
+            "    // displaced by an estimator guess.\n" +
+            "    vec4 cDirect = texture(uCurr, vUV);\n" +
+            "    vec4 pDirect = texture(uPrev, vUV);\n" +
+            "    float sd = dot(abs(pDirect.rgb - cDirect.rgb), vec3(0.3333));\n" +
+            "    float isStatic = 1.0 - smoothstep(0.008, 0.025, sd);\n" +
+            "    outc = mix(outc, cDirect, isStatic);\n" +
+            "\n" +
+            "    // Binary validity in alpha for the inpaint pass (continuous\n" +
+            "    // validity there would soften every partially-trusted pixel).\n" +
+            "    float validBin = max(step(0.45, valid), isStatic);\n" +
+            "    outColor = vec4(outc.rgb, validBin);\n" +
+            "}\n";
+
+    // Occlusion inpaint: input RGBA carries per-pixel validity in alpha.
+    // Fully-invalid pixels (disocclusion holes, frame borders) are filled
+    // with a validity-weighted average of their 8 neighbours at a 2-texel
+    // radius — enough to bridge typical 1..4px disocclusion seams without a
+    // full multi-pass diffusion. Written branchless (all texture fetches in
+    // uniform control flow) so it is safe on every mobile GPU driver.
+    private static final String INPAINT_FRAG =
+            "#version 300 es\n" +
+            "precision highp float;\n" +
+            "uniform mediump sampler2D uSrc;\n" +
+            "uniform vec2 uTexel;\n" +
+            "in vec2 vUV;\n" +
+            "out vec4 outColor;\n" +
+            "\n" +
+            "void main() {\n" +
+            "    vec4 c = texture(uSrc, vUV);\n" +
+            "    vec3 acc = vec3(0.0);\n" +
+            "    float wsum = 0.0;\n" +
+            "    for (int y = -1; y <= 1; y++) {\n" +
+            "        for (int x = -1; x <= 1; x++) {\n" +
+            "            if (x == 0 && y == 0) continue;\n" +
+            "            vec2 uv = clamp(vUV + vec2(float(x), float(y)) * uTexel * 2.0,\n" +
+            "                            vec2(0.0), vec2(1.0));\n" +
+            "            vec4 n = texture(uSrc, uv);\n" +
+            "            float w = n.a * n.a;\n" +
+            "            acc += n.rgb * w;\n" +
+            "            wsum += w;\n" +
+            "        }\n" +
+            "    }\n" +
+            "    vec3 filled = (wsum > 0.0001) ? acc / wsum : c.rgb;\n" +
+            "    outColor = vec4(mix(c.rgb, filled, 1.0 - step(0.5, c.a)), 1.0);\n" +
             "}\n";
 
     // ─── Imports that need no ambiguity ─────────────────────────────────────
