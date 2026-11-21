@@ -1431,14 +1431,31 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         inputCaptureProvider.onWindowFocusChanged(hasFocus);
     }
 
+    // Refresh rate the panel should run at. With frame interpolation the displayed
+    // content rate is fps x multiplier (e.g. 60 x 2 = 120 Hz), not the raw stream
+    // fps. Matching the raw stream fps here makes prepareDisplayForRendering() pick
+    // a 60 Hz display mode, which leaves no vsync slots for synthetic frames.
+    private int displayTargetFps() {
+        if (prefConfig != null && prefConfig.frameInterpolation && prefConfig.fps > 0) {
+            int mult = prefConfig.frameInterpolationMultiplier;
+            if (mult < 2 || mult > 4) {
+                mult = 2;
+            }
+            return prefConfig.fps * mult;
+        }
+        return (prefConfig != null && prefConfig.fps > 0) ? prefConfig.fps : 60;
+    }
+
     private boolean isRefreshRateEqualMatch(float refreshRate) {
-        return refreshRate >= prefConfig.fps &&
-                refreshRate <= prefConfig.fps + 3;
+        int target = displayTargetFps();
+        return refreshRate >= target &&
+                refreshRate <= target + 3;
     }
 
     private boolean isRefreshRateGoodMatch(float refreshRate) {
-        return refreshRate >= prefConfig.fps &&
-                Math.round(refreshRate) % prefConfig.fps <= 3;
+        int target = displayTargetFps();
+        return refreshRate >= target &&
+                Math.round(refreshRate) % target <= 3;
     }
 
     private boolean shouldIgnoreInsetsForResolution(int width, int height) {
@@ -1462,6 +1479,11 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     }
 
     private boolean mayReduceRefreshRate() {
+        if (prefConfig != null && prefConfig.frameInterpolation) {
+            // Frame interpolation needs spare vsync slots (fps x multiplier), so never
+            // let the mode picker trade refresh rate away to match the stream fps.
+            return false;
+        }
         return prefConfig.framePacing == PreferenceConfiguration.FRAME_PACING_CAP_FPS ||
                 prefConfig.framePacing == PreferenceConfiguration.FRAME_PACING_MAX_SMOOTHNESS ||
                 (prefConfig.framePacing == PreferenceConfiguration.FRAME_PACING_BALANCED && prefConfig.reduceRefreshRate);
@@ -1570,7 +1592,14 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                 // If we only changed refresh rate and we're on an OS that supports Surface.setFrameRate()
                 // use that instead of using preferredDisplayModeId to avoid the possibility of triggering
                 // bugs that can cause the system to switch from 4K60 to 4K24 on Chromecast 4K.
-                if (prefConfig.enforceDisplayMode ||
+                //
+                // Frame interpolation must NOT take that shortcut: on ColorOS/OxygenOS the
+                // surface-level setFrameRate() vote is frequently ignored or overridden by the
+                // vendor power policy (panel drops back to 60 Hz), while a window-level
+                // preferredDisplayModeId is honoured. Force the mode request when interpolating.
+                boolean interpForceDisplayMode = prefConfig != null && prefConfig.frameInterpolation;
+                if (interpForceDisplayMode ||
+                        prefConfig.enforceDisplayMode ||
                         Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
                         currentDisplay.getMode().getPhysicalWidth() != bestMode.getPhysicalWidth() ||
                         currentDisplay.getMode().getPhysicalHeight() != bestMode.getPhysicalHeight()) {
