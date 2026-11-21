@@ -258,6 +258,8 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             LimeLog.warning("Occlusion inpaint program unavailable, using nearest-frame fallback");
         }
 
+        metricsProgram = createProgram(VERT_SHADER, METRICS_FRAG);
+
         if (engine != ENGINE_NONE && synthProgram == 0) {
             LimeLog.severe("Frame interpolation: synthesis program failed to compile, interpolation disabled");
             engine = ENGINE_NONE;
@@ -413,6 +415,9 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
 
         if (hasPrevFrame) {
             runMotionEstimation();
+            if (meFailed) {
+                meFailCount++;
+            }
         }
 
         // Swap prev/curr
@@ -524,6 +529,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             drawTextureToScreen(frameTexA);
             return;
         }
+        synthCount++;
 
         int mvTex;
         float mvMode;
@@ -600,6 +606,10 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         }
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
 
+        // Quality telemetry (H): accumulate sparse invalid-pixel samples.
+        // Must run BEFORE the inpaint pass, which overwrites alpha with 1.
+        renderMetrics(outTex);
+
         // Occlusion inpaint: the synthesis pass writes its per-pixel validity
         // into alpha; this pass fills fully-invalid pixels (disocclusions,
         // frame borders) with a validity-weighted average of the surrounding
@@ -625,10 +635,54 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         drawTextureToScreen(outTex);
     }
 
+    // (H) Additive-accumulation telemetry pass. Runs at METRICS_RES x
+    // METRICS_RES (256 fragments), blending one sparse sample per frame
+    // into a tiny RGBA16F target; updateFps() reads the sums back once per
+    // second and clears the target for the next window. Blend state is
+    // strictly scoped: every other pass in this renderer runs with
+    // blending disabled and never sees it enabled.
+    private void renderMetrics(int srcTex) {
+        if (metricsProgram == 0) {
+            return;
+        }
+        if (metricsTex == 0) {
+            metricsTex = createRgba16fTexture(METRICS_RES, METRICS_RES);
+            int[] fbos = new int[1];
+            GLES20.glGenFramebuffers(1, fbos, 0);
+            metricsFbo = fbos[0];
+        }
+        if (metricsFbo == 0 || metricsTex == 0) {
+            return;
+        }
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, metricsFbo);
+        GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0,
+                GLES20.GL_TEXTURE_2D, metricsTex, 0);
+        GLES20.glViewport(0, 0, METRICS_RES, METRICS_RES);
+        GLES20.glUseProgram(metricsProgram);
+        bindQuad(metricsProgram);
+        GLES20.glEnable(GLES20.GL_BLEND);
+        GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE);
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, srcTex);
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(metricsProgram, "uSrc"), 0);
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+        GLES20.glDisable(GLES20.GL_BLEND);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0);
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
+    }
+
     private int synthTex = 0;
     private int synthTex2 = 0;
     private int synthFbo = 0;
     private int lastScreenTex = 0;
+
+    // Quality telemetry (H): sparse additive accumulation target + counters.
+    private static final int METRICS_RES = 16;
+    private int metricsProgram = 0;
+    private int metricsTex = 0;
+    private int metricsFbo = 0;
+    private int synthCount = 0;
+    private int meFailCount = 0;
 
     private int getSynthTex() {
         if (synthTex == 0) {
@@ -692,6 +746,8 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, srcTex);
         GLES20.glUniform1i(GLES20.glGetUniformLocation(lumaProgram, "s_InputTexture"), 0);
+        GLES20.glUniform2f(GLES20.glGetUniformLocation(lumaProgram, "uTexel"),
+                1.0f / Math.max(1, frameWidth), 1.0f / Math.max(1, frameHeight));
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0);
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
@@ -978,16 +1034,52 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         if (elapsed >= 1_000_000_000L) {
             displayFps = displayFrameCount * 1_000_000_000f / elapsed;
             sourceFps = sourceFrameCount * 1_000_000_000f / elapsed;
+            int realFrames = Math.max(1, sourceFrameCount);
+            float meFailPct = 100.0f * meFailCount / realFrames;
             displayFrameCount = 0;
             sourceFrameCount = 0;
             fpsWindowStart = now;
+
+            // (H) once-per-second telemetry readback: 256 texels from the
+            // additive accumulation target, then reset it for the next
+            // window. glReadPixels of RGBA16F as GL_FLOAT works on any
+            // driver that renders RGBA16F (EXT_color_buffer_float); if the
+            // format pair is refused the buffer stays zero and the metric
+            // is skipped for that window — logging only, never fatal.
+            float invalidRate = -1.0f;
+            if (metricsFbo != 0 && metricsTex != 0) {
+                java.nio.FloatBuffer buf = java.nio.ByteBuffer
+                        .allocateDirect(METRICS_RES * METRICS_RES * 16)
+                        .order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer();
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, metricsFbo);
+                GLES20.glReadPixels(0, 0, METRICS_RES, METRICS_RES,
+                        GLES20.GL_RGBA, GLES20.GL_FLOAT, buf);
+                GLES20.glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
+                buf.rewind();
+                double invSum = 0.0, cntSum = 0.0;
+                for (int i = 0; i < METRICS_RES * METRICS_RES; i++) {
+                    invSum += buf.get();
+                    cntSum += buf.get();
+                }
+                if (cntSum > 0.5) {
+                    invalidRate = (float) (invSum / cntSum);
+                }
+            }
+
             LimeLog.info("Frame interpolation: display=" + String.format("%.1f", displayFps)
                     + " source=" + String.format("%.1f", sourceFps)
                     + " engine=" + engineString() + " x" + multiplier
                     + String.format(" phase=%.2f", phaseAdvance)
+                    + String.format(" meFail=%.0f%%", meFailPct)
+                    + String.format(" synth=%d", synthCount)
+                    + (invalidRate >= 0.0f ? String.format(" invalid=%.1f%%", invalidRate * 100.0f) : "")
                     + (ingestCount > 0 ? String.format(" ingestAvg=%.1fms", ingestAccumNs / 1e6 / ingestCount) : ""));
             ingestAccumNs = 0;
             ingestCount = 0;
+            meFailCount = 0;
+            synthCount = 0;
         }
     }
 
@@ -1018,12 +1110,12 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         // so a fast surface recreation could make it delete the NEW resources.
         final int[] progSnap = {copyProgram, lumaProgram, lumaHalfProgram, meProgram,
                 refineProgram, fuseProgram, smoothProgram, synthProgram,
-                presentProgram, inpaintProgram};
+                presentProgram, inpaintProgram, metricsProgram};
         final int[] texSnap = {videoTextureId, frameTexA, frameTexB, lumaTexA, lumaTexB,
                 lumaHalfA, lumaHalfB, mvTexA, mvTexB, mvTexHw, mvTexHwHalf,
-                mvTexBwd, mvBwdSm, mvRawFusedTex, mvSmA, mvSmB, synthTex, synthTex2};
+                mvTexBwd, mvBwdSm, mvRawFusedTex, mvSmA, mvSmB, synthTex, synthTex2, metricsTex};
         final int[] fboSnap = {frameFbo, lumaFbo, lumaHalfFbo, synthFbo,
-                mvFboA, mvFboB, fuseFbo, smoothFbo};
+                mvFboA, mvFboB, fuseFbo, smoothFbo, metricsFbo};
 
         if (glSurfaceView != null) {
             glSurfaceView.queueEvent(() -> {
@@ -1097,6 +1189,8 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         synthTex = 0; synthTex2 = 0; synthFbo = 0;
         frameFbo = 0; lumaFbo = 0; lumaHalfFbo = 0;
         mvFboA = 0; mvFboB = 0; fuseFbo = 0; smoothFbo = 0;
+        metricsProgram = 0; metricsTex = 0; metricsFbo = 0;
+        synthCount = 0; meFailCount = 0;
     }
 
     // ─── GL helpers ──────────────────────────────────────────────────────────
@@ -1216,14 +1310,30 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             "    outColor = texture(s_InputTexture, tuv);\n" +
             "}\n";
 
+    // Full-resolution luma fed to the hardware motion estimators. A very
+    // light 3x3 Gaussian runs first: codec blocking noise pollutes the
+    // block-matching SAD and makes the estimator flicker on dark and
+    // gradient scenes. The blur touches only the estimation input —
+    // synthesis always samples the untouched frame textures — so the
+    // visible image quality is never affected by it.
     private static final String LUMA_FRAG =
             "#version 300 es\n" +
             "precision mediump float;\n" +
             "uniform mediump sampler2D s_InputTexture;\n" +
+            "uniform vec2 uTexel;\n" +
             "in vec2 vUV;\n" +
             "out vec4 outColor;\n" +
             "void main() {\n" +
-            "    vec3 c = texture(s_InputTexture, vUV).rgb;\n" +
+            "    vec3 acc = texture(s_InputTexture, vUV).rgb * 4.0;\n" +
+            "    acc += (texture(s_InputTexture, vUV + vec2(-uTexel.x, 0.0)).rgb\n" +
+            "          + texture(s_InputTexture, vUV + vec2(uTexel.x, 0.0)).rgb\n" +
+            "          + texture(s_InputTexture, vUV + vec2(0.0, -uTexel.y)).rgb\n" +
+            "          + texture(s_InputTexture, vUV + vec2(0.0, uTexel.y)).rgb) * 2.0;\n" +
+            "    acc += texture(s_InputTexture, vUV + vec2(-uTexel.x, -uTexel.y)).rgb\n" +
+            "         + texture(s_InputTexture, vUV + vec2(uTexel.x, -uTexel.y)).rgb\n" +
+            "         + texture(s_InputTexture, vUV + vec2(-uTexel.x, uTexel.y)).rgb\n" +
+            "         + texture(s_InputTexture, vUV + vec2(uTexel.x, uTexel.y)).rgb;\n" +
+            "    vec3 c = acc / 16.0;\n" +
             "    float l = 0.299 * c.r + 0.587 * c.g + 0.114 * c.b;\n" +
             "    outColor = vec4(l, 0.0, 0.0, 1.0);\n" +
             "}\n";
@@ -1536,14 +1646,30 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             "    // forward vector into curr and the backward vector out of curr\n" +
             "    // cancel. A mismatch means one side of the pair is hidden there\n" +
             "    // (occlusion) and any blend would place content twice.\n" +
+            "    //\n" +
+            "    // Occlusion-aware side weighting (A): the FBC test at the warped\n" +
+            "    // position only says the pair is globally consistent there. A\n" +
+            "    // second test at THIS pixel (forward mv vs backward mv at vUV)\n" +
+            "    // localises the occlusion. At a consistent pixel the phase-\n" +
+            "    // balanced mix is kept unchanged; at a suspected occlusion the\n" +
+            "    // blend leans hard toward the temporally nearest real frame —\n" +
+            "    // trading a tiny early snap for removing the double-image ghost.\n" +
+            "    // With the backward field disabled (FBC off) ph stays exactly\n" +
+            "    // uPhase, i.e. the previous behaviour.\n" +
+            "    float ph = uPhase;\n" +
             "    if (uFbcValid > 0.5) {\n" +
             "        vec2 mvBwd = texture(uMvBwd, cc).rg;\n" +
             "        if (!(dot(mvBwd, mvBwd) < 1.0e10)) mvBwd = vec2(0.0);\n" +
             "        float fbc = length(mvPx + mvBwd);\n" +
             "        valid *= 1.0 - smoothstep(uFbcThresh, uFbcThresh * 2.0, fbc);\n" +
+            "\n" +
+            "        vec2 mvBwdHere = texture(uMvBwd, vUV).rg;\n" +
+            "        float bHere = (dot(mvBwdHere, mvBwdHere) < 1.0e10) ? length(mvPx + mvBwdHere) : 1.0e6;\n" +
+            "        float consHere = 1.0 - smoothstep(uFbcThresh, uFbcThresh * 2.0, bHere);\n" +
+            "        ph = mix(uPhase, uPhase < 0.5 ? 0.0 : 1.0, 1.0 - consHere);\n" +
             "    }\n" +
             "\n" +
-            "    vec4 synth = mix(cPrev, cCurr, uPhase);\n" +
+            "    vec4 synth = mix(cPrev, cCurr, ph);\n" +
             "    vec4 nearest = (uPhase < 0.5) ? cPrev : cCurr;\n" +
             "    vec4 outc = mix(nearest, synth, valid);\n" +
             "\n" +
@@ -1595,6 +1721,25 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             "    }\n" +
             "    vec3 filled = (wsum > 0.0001) ? acc / wsum : c.rgb;\n" +
             "    outColor = vec4(mix(c.rgb, filled, 1.0 - step(0.5, c.a)), 1.0);\n" +
+            "}\n";
+
+    // Quality telemetry (H): a tiny 16x16 additive-accumulation target.
+    // Every synthetic frame adds one sparse sample per texel (256 points
+    // over the frame); once per second the accumulated sums are read back
+    // and logged as the invalid-pixel (disocclusion / gate-fail) rate, so
+    // tuning can be judged on numbers instead of feel. Blending on RGBA16F
+    // only needs EXT_color_buffer_float, already required for the motion
+    // fields; if a driver refuses the blend the metric merely degrades to
+    // a last-frame sample and nothing breaks.
+    private static final String METRICS_FRAG =
+            "#version 300 es\n" +
+            "precision mediump float;\n" +
+            "uniform mediump sampler2D uSrc;\n" +
+            "in vec2 vUV;\n" +
+            "out vec4 outColor;\n" +
+            "void main() {\n" +
+            "    vec4 c = texture(uSrc, vUV);\n" +
+            "    outColor = vec4(1.0 - c.a, 1.0, 0.0, 0.0);\n" +
             "}\n";
 
     // ─── Imports that need no ambiguity ─────────────────────────────────────
