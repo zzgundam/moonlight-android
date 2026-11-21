@@ -755,5 +755,7 @@
     <string name="summary_frame_interp_phase">How much earlier a synthesized frame claims a refresh slot. Higher values make interpolation more aggressive when the source cadence is jittery, but can add slight motion artifacts. 0.0 keeps the original timing. Requires reconnecting the stream.</string>
     <string name="title_frame_interp_gate">Interp confidence gate</string>
     <string name="summary_frame_interp_gate">How much per-pixel disagreement is tolerated before the synthesis falls back to the nearest real frame. Lower values cut ghosting on video content (motion blur, codec noise), at the cost of less motion smoothing. 0.22 is the original value and best for clean game frames; 0.12 is recommended for video. Requires reconnecting the stream.</string>
+    <string name="title_frame_interp_blur">Frame blur / softening</string>
+    <string name="summary_frame_interp_blur">Blends each presented frame with the previous one (temporal persistence), turning discrete frame steps into short motion trails. Reduces pan judder, especially for 25/30 fps video on a 60/120 Hz screen. Works with or without frame interpolation. Higher values are smoother but blurrier. Requires reconnecting the stream.</string>
     <string name="perf_overlay_interp_fps">Interp: %1$.2f &#8594; %2$.2f FPS (%3$s)</string>
 </resources>

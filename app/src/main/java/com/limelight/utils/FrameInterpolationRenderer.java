@@ -70,6 +70,9 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     // mismatch, so nearly every pixel blended and panning shots ghosted.
     private static final float CUT_THRESHOLD = 0.22f;
     private static final float[] GATE_THRESHOLDS = {0.22f, 0.15f, 0.12f, 0.08f};
+    // Blur/softening levels (user setting): temporal persistence strength.
+    // 0 disables the pass; higher values leave longer motion trails.
+    private static final float[] BLUR_STRENGTHS = {0.0f, 0.3f, 0.5f, 0.7f};
 
     private static final long MIN_FRAME_INTERVAL_NS = 1_000_000L;
     private static final long MAX_FRAME_INTERVAL_NS = 100_000_000L;
@@ -92,6 +95,8 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     private final float phaseAdvance;   // user setting: how much earlier synthetic frames claim a vsync slot
     private final double stallThresh;   // user setting: progress beyond which the stream is treated as stalled
     private final float cutThreshold;   // user setting: post-compensation residual gate (ghosting vs coverage)
+    private final boolean interpEnabled; // false = pass-through: present decoded frames as-is, no ME/synthesis
+    private final float blurStrength;   // user setting: temporal persistence strength (0 = off)
 
     private final FloatBuffer quadVertexBuffer;
     private final FloatBuffer textureVertexBuffer;
@@ -203,6 +208,9 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         this.stallThresh = 1.35 + phaseLevel * 0.15; // 1.35 / 1.50 / 1.65 / 1.80
         int gateLevel = Math.max(0, Math.min(3, prefConfig.frameInterpolationGate));
         this.cutThreshold = GATE_THRESHOLDS[gateLevel]; // 0.22 / 0.15 / 0.12 / 0.08
+        this.interpEnabled = prefConfig.frameInterpolation;
+        int blurLevel = Math.max(0, Math.min(3, prefConfig.frameInterpolationBlur));
+        this.blurStrength = BLUR_STRENGTHS[blurLevel]; // 0.0 / 0.3 / 0.5 / 0.7
         FrameInterpolationRenderer.multiplier = Math.max(2, Math.min(4, prefConfig.frameInterpolationMultiplier));
         // Seed the cadence estimate from the configured stream FPS instead of
         // assuming 60; a 30 FPS source would otherwise look "stalled" for the
@@ -353,6 +361,26 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             newFrame = frameAvailable.getAndSet(false);
         }
 
+        if (!interpEnabled) {
+            // Pass-through mode (interpolation disabled): present every
+            // decoded frame at the next vsync and repeat the last presented
+            // frame otherwise. No slots, no synthesis, no motion estimation.
+            if (newFrame && glReady) {
+                long t0 = System.nanoTime();
+                ingestFrame(now);
+                ingestAccumNs += System.nanoTime() - t0;
+                ingestCount++;
+                presentReal();
+                displayFrameCount++;
+                sourceFrameCount++;
+            } else if (glReady && lastScreenTex != 0) {
+                repeatPresentCount++;
+                drawTextureToScreen(lastScreenTex);
+            }
+            updateFps(now);
+            return;
+        }
+
         if (newFrame && glReady) {
             // A newly decoded frame always takes this vsync. A GLSurfaceView
             // swaps once per onDrawFrame, so "catching up" several overdue
@@ -445,17 +473,20 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             return;
         }
 
-        // Copy decoded frame into the curr texture and its luma pyramid
+        // Copy decoded frame into the curr texture. In pass-through mode this
+        // is all ingest does: no luma pyramid, no motion estimation.
         copyExternalToTexture(videoTextureId, frameTexB, stMatrix);
-        renderLuma(frameTexB, lumaTexB);
-        if (engine == ENGINE_QCOM_ME && halfScaleMe && lumaHalfProgram != 0) {
-            renderLumaHalf(frameTexB, lumaHalfB);
-        }
+        if (interpEnabled) {
+            renderLuma(frameTexB, lumaTexB);
+            if (engine == ENGINE_QCOM_ME && halfScaleMe && lumaHalfProgram != 0) {
+                renderLumaHalf(frameTexB, lumaHalfB);
+            }
 
-        if (hasPrevFrame) {
-            runMotionEstimation();
-            if (meFailed) {
-                meFailCount++;
+            if (hasPrevFrame) {
+                runMotionEstimation();
+                if (meFailed) {
+                    meFailCount++;
+                }
             }
         }
 
@@ -718,6 +749,20 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     private int synthFbo = 0;
     private int lastScreenTex = 0;
 
+    // Blur/softening (temporal persistence) resources. The presented frame is
+    // blended with the previous presented frame: out = cur*(1-b) + prev*b.
+    // Repeats of the same texture are presented raw so trails don't accumulate.
+    private int blendProgram = 0;
+    private final int[] blendTex = new int[2];   // double-buffered blend targets
+    private int blendCurIdx = 0;                 // texture written this pass
+    private int blendFbo = 0;
+    private boolean blendHistoryValid = false;
+    private final float[] identityMatrix = {
+            1.0f, 0.0f, 0.0f, 0.0f,
+            0.0f, 1.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 1.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 1.0f};
+
     // Quality telemetry (H): sparse additive accumulation target + counters.
     private static final int METRICS_RES = 16;
     private int metricsProgram = 0;
@@ -745,6 +790,18 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             return;
         }
         applyScreenViewport();
+        if (blurStrength > 0.0f && glReady
+                && tex != lastScreenTex && tex != lastContentTex) {
+            // New content: blend with the previous presented frame to soften
+            // discrete frame steps (pan judder). Skipped for repeats — both
+            // the idle re-present of lastScreenTex and re-presentation of the
+            // same source texture (stream stall) — so trails never accumulate.
+            int blended = renderBlendPass(tex);
+            if (blended != 0) {
+                tex = blended;
+            }
+        }
+        lastContentTex = tex;
         lastScreenTex = tex;
         GLES20.glUseProgram(presentProgram);
         bindQuad(presentProgram);
@@ -753,6 +810,79 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         GLES20.glUniform1i(GLES20.glGetUniformLocation(presentProgram, "s_InputTexture"), 0);
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0);
+    }
+
+    // Blend the current frame with the previous presented frame (temporal
+    // persistence). Returns the blended texture to present, or 0 to present
+    // the raw input (first frame, or shader/texture allocation failure).
+    private int renderBlendPass(int curTex) {
+        if (blendProgram == 0) {
+            blendProgram = createProgram(VERT_SHADER, BLEND_FRAG);
+            if (blendProgram == 0) {
+                return 0;
+            }
+        }
+        if (blendTex[0] == 0 && frameWidth > 0) {
+            blendTex[0] = createColorTexture(frameWidth, frameHeight);
+            blendTex[1] = createColorTexture(frameWidth, frameHeight);
+            int[] fbo = new int[1];
+            GLES20.glGenFramebuffers(1, fbo, 0);
+            blendFbo = fbo[0];
+        }
+        if (blendTex[0] == 0 || blendTex[1] == 0 || blendFbo == 0) {
+            return 0;
+        }
+        if (!blendHistoryValid) {
+            // Seed the history with the current frame so the first real blend
+            // is a visual no-op; this frame is presented raw.
+            copyColorTex(curTex, blendTex[1 - blendCurIdx]);
+            blendHistoryValid = true;
+            return 0;
+        }
+        int dst = blendTex[blendCurIdx];
+        int prev = blendTex[1 - blendCurIdx];
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, blendFbo);
+        GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0,
+                GLES20.GL_TEXTURE_2D, dst, 0);
+        GLES20.glViewport(0, 0, frameWidth, frameHeight);
+        GLES20.glUseProgram(blendProgram);
+        bindQuad(blendProgram);
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, curTex);
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(blendProgram, "s_Cur"), 0);
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE1);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, prev);
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(blendProgram, "s_Prev"), 1);
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(blendProgram, "uBlur"), blurStrength);
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE1);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0);
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0);
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
+        applyScreenViewport();
+        // The texture just written becomes the history for the next frame.
+        blendCurIdx = 1 - blendCurIdx;
+        return dst;
+    }
+
+    // Plain color-texture -> color-texture copy (reuses copyProgram).
+    private void copyColorTex(int srcTex, int dstTex) {
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, frameFbo);
+        GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0,
+                GLES20.GL_TEXTURE_2D, dstTex, 0);
+        GLES20.glViewport(0, 0, frameWidth, frameHeight);
+        GLES20.glUseProgram(copyProgram);
+        bindQuad(copyProgram);
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, srcTex);
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(copyProgram, "s_InputTexture"), 0);
+        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(copyProgram, "uTransform"),
+                1, false, identityMatrix, 0);
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0);
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
+        applyScreenViewport();
     }
 
     private void bindQuad(int program) {
@@ -943,18 +1073,22 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     private void allocateFrameResources() {
         frameTexA = createColorTexture(frameWidth, frameHeight);
         frameTexB = createColorTexture(frameWidth, frameHeight);
-        lumaTexA = createR8Texture(frameWidth, frameHeight);
-        lumaTexB = createR8Texture(frameWidth, frameHeight);
+        if (interpEnabled) {
+            lumaTexA = createR8Texture(frameWidth, frameHeight);
+            lumaTexB = createR8Texture(frameWidth, frameHeight);
+        }
 
         int[] fbos = new int[1];
         GLES20.glGenFramebuffers(1, fbos, 0);
         frameFbo = fbos[0];
-        GLES20.glGenFramebuffers(1, fbos, 0);
-        lumaFbo = fbos[0];
+        if (interpEnabled) {
+            GLES20.glGenFramebuffers(1, fbos, 0);
+            lumaFbo = fbos[0];
+        }
         GLES20.glGenFramebuffers(1, fbos, 0);
         synthFbo = fbos[0];
 
-        if (engine == ENGINE_GLSL) {
+        if (interpEnabled && engine == ENGINE_GLSL) {
             int mvW = (frameWidth + MV_GRID - 1) / MV_GRID;
             int mvH = (frameHeight + MV_GRID - 1) / MV_GRID;
             mvGridW = mvW;
@@ -965,7 +1099,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             mvFboA = fbos[0];
             GLES20.glGenFramebuffers(1, fbos, 0);
             mvFboB = fbos[0];
-        } else if (engine == ENGINE_QCOM_ME) {
+        } else if (interpEnabled && engine == ENGINE_QCOM_ME) {
             BlockParams params = new BlockParams();
             boolean ok = false;
             try {
@@ -1256,12 +1390,13 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         // so a fast surface recreation could make it delete the NEW resources.
         final int[] progSnap = {copyProgram, lumaProgram, lumaHalfProgram, meProgram,
                 refineProgram, fuseProgram, smoothProgram, synthProgram,
-                presentProgram, inpaintProgram, metricsProgram};
+                presentProgram, inpaintProgram, metricsProgram, blendProgram};
         final int[] texSnap = {videoTextureId, frameTexA, frameTexB, lumaTexA, lumaTexB,
                 lumaHalfA, lumaHalfB, mvTexA, mvTexB, mvTexHw, mvTexHwHalf,
-                mvTexBwd, mvBwdSm, mvRawFusedTex, mvSmA, mvSmB, synthTex, synthTex2, metricsTex};
+                mvTexBwd, mvBwdSm, mvRawFusedTex, mvSmA, mvSmB, synthTex, synthTex2, metricsTex,
+                blendTex[0], blendTex[1]};
         final int[] fboSnap = {frameFbo, lumaFbo, lumaHalfFbo, synthFbo,
-                mvFboA, mvFboB, fuseFbo, smoothFbo, metricsFbo};
+                mvFboA, mvFboB, fuseFbo, smoothFbo, metricsFbo, blendFbo};
 
         if (glSurfaceView != null) {
             glSurfaceView.queueEvent(() -> {
@@ -1336,6 +1471,9 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         frameFbo = 0; lumaFbo = 0; lumaHalfFbo = 0;
         mvFboA = 0; mvFboB = 0; fuseFbo = 0; smoothFbo = 0;
         metricsProgram = 0; metricsTex = 0; metricsFbo = 0;
+        blendProgram = 0; blendTex[0] = 0; blendTex[1] = 0;
+        blendFbo = 0; blendCurIdx = 0; blendHistoryValid = false;
+        lastContentTex = 0;
         synthCount = 0; meFailCount = 0;
     }
 
@@ -1591,6 +1729,23 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             "    vec2 r2 = med3v(samp(vUV + vec2(-t.x, t.y)), samp(vUV + vec2(0.0, t.y)), samp(vUV + vec2(t.x, t.y)));\n" +
             "    vec2 m = med3v(r0, r1, r2);\n" +
             "    outColor = vec4(m, texture(uMvRaw, vUV).b, 1.0);\n" +
+            "}\n";
+
+    // Temporal persistence blend: out = cur*(1-b) + prev*b. Smears discrete
+    // frame steps into short motion trails, reducing perceived judder for
+    // pan shots whose cadence does not divide the refresh rate.
+    private static final String BLEND_FRAG =
+            "#version 300 es\n" +
+            "precision mediump float;\n" +
+            "uniform mediump sampler2D s_Cur;\n" +
+            "uniform mediump sampler2D s_Prev;\n" +
+            "uniform mediump float uBlur;\n" +
+            "in vec2 vUV;\n" +
+            "out vec4 outColor;\n" +
+            "void main() {\n" +
+            "    vec3 c = texture(s_Cur, vUV).rgb;\n" +
+            "    vec3 p = texture(s_Prev, vUV).rgb;\n" +
+            "    outColor = vec4(mix(c, p, uBlur), 1.0);\n" +
             "}\n";
 
     private static final String PRESENT_FRAG =

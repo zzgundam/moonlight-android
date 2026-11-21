@@ -727,5 +727,7 @@
     <string name="summary_frame_interp_phase">合成帧提前占用刷新槽的程度。数值越大，源帧节奏抖动时插帧越激进、越不容易丢帧，但可能略增运动伪影。0.0 保持原有节奏。修改后需重新连接串流生效。</string>
     <string name="title_frame_interp_gate">插帧置信门槛</string>
     <string name="summary_frame_interp_gate">逐像素前后帧失配超过该阈值时，合成结果回退为最近的真实帧。数值越低越能抑制视频内容的重影（运动模糊、编码噪声），代价是运动平滑度下降。0.22 为原始值、适合干净的游戏画面；视频内容建议 0.12。修改后需重新连接串流生效。</string>
+    <string name="title_frame_interp_blur">帧柔化（运动模糊）</string>
+    <string name="summary_frame_interp_blur">将当前上屏帧与上一帧按比例混合（时间持续性），把离散的画面跳变抹成短促的拖影，显著减轻横摇镜头的跳跃感，对 25/30fps 视频在 60/120Hz 屏上的顿挫尤其有效。开启或关闭插帧时均可用。数值越大越顺滑，但模糊感越强。修改后需重新连接串流生效。</string>
     <string name="perf_overlay_interp_fps">插帧： %1$.2f &#8594; %2$.2f FPS (%3$s)</string>
 </resources>

@@ -94,7 +94,12 @@ public class StreamContainer extends FrameLayout implements SurfaceHolder.Callba
             glSurfaceView.setRenderMode(GLSurfaceView.RENDERMODE_WHEN_DIRTY);
             mSurfaceView = glSurfaceView;
             addView(mSurfaceView, childParams);
-        } else if (prefConfig.frameInterpolation) {
+        } else {
+            // 2D always renders through the GL path. With interpolation
+            // disabled the renderer runs in pass-through mode (decode ->
+            // upload -> present, no motion estimation or synthesis), which
+            // also enables the blur/softening post effect without
+            // interpolation.
             GLSurfaceView glSurfaceView = new GLSurfaceView(context);
             glSurfaceView.setEGLContextClientVersion(3);
             mInterpRenderer = new FrameInterpolationRenderer(glSurfaceView, this, context, prefConfig);

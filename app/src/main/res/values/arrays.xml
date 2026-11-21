@@ -234,4 +234,16 @@
     <item>2</item>
     <item>3</item>
     </string-array>
+    <string-array name="frame_interp_blur_names" translatable="false">
+    <item>Off</item>
+    <item>Light (0.3)</item>
+    <item>Medium (0.5)</item>
+    <item>Heavy (0.7)</item>
+    </string-array>
+    <string-array name="frame_interp_blur_values" translatable="false">
+    <item>0</item>
+    <item>1</item>
+    <item>2</item>
+    <item>3</item>
+    </string-array>
 </resources>
