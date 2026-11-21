@@ -721,6 +721,8 @@
     <string name="summary_frame_interp_multiplier">每个源帧生成的输出帧数（需要屏幕刷新率为相应倍数）。</string>
     <string name="title_checkbox_frame_interp_fbc">遮挡检查（FBC）</string>
     <string name="summary_checkbox_frame_interp_fbc">默认关闭。开启后额外跑一次反向运动估计来识别遮挡，减少快速运动时的双影/重影；每帧多一次 GPU 计算，会增加 GPU 负载与发热。修改后需重新连接串流生效。</string>
+    <string name="title_checkbox_frame_interp_diag_log">写入诊断日志</string>
+    <string name="summary_checkbox_frame_interp_diag_log">默认关闭。开启后每秒向 Android/data/&lt;包名&gt;/files/frame_interp_log.txt 追加一行诊断数据（渲染循环频率、真帧/合成帧/重复/丢槽/卡顿比例、取帧耗时、ME 失败率与无效像素率），仅用于排查插帧节奏问题。会持续写存储，平时请保持关闭。修改后需重新连接串流生效。</string>
     <string name="title_frame_interp_phase">插帧触发相位</string>
     <string name="summary_frame_interp_phase">合成帧提前占用刷新槽的程度。数值越大，源帧节奏抖动时插帧越激进、越不容易丢帧，但可能略增运动伪影。0.0 保持原有节奏。修改后需重新连接串流生效。</string>
     <string name="perf_overlay_interp_fps">插帧： %1$.2f &#8594; %2$.2f FPS (%3$s)</string>

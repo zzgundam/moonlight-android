@@ -161,6 +161,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     private int stallHoldCount = 0;      // stream-stall holds (progress > 1.35)
 
     private Context logContext = null;
+    private final boolean diagLogEnabled;
     private File diagFile = null;
     private BufferedWriter diagWriter = null;
     private boolean diagSessionHeader = false;
@@ -190,6 +191,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         this.onSurfaceReadyListener = listener;
         this.prefConfig = prefConfig;
         this.logContext = context;
+        this.diagLogEnabled = prefConfig.frameInterpolationDiagLog;
         this.fbcEnabled = prefConfig.frameInterpolationFbc;
         int phaseLevel = Math.max(0, Math.min(3, prefConfig.frameInterpolationPhase));
         this.phaseAdvance = phaseLevel * 0.10f;      // 0.0 / 0.1 / 0.2 / 0.3
@@ -1146,6 +1148,9 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
                                float realFps, float synthFps, float repeatFps,
                                float gateMissFps, float stallFps, float meFailPct,
                                float invalidRate, float ingestAvgMs) {
+        if (!diagLogEnabled) {
+            return;
+        }
         try {
             if (logContext == null) {
                 return;
@@ -1175,7 +1180,10 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
                 diagWriter.write(header);
                 diagWriter.newLine();
             }
-            String ts = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(new Date(now));
+            // Wall-clock timestamp: `now` is System.nanoTime() (arbitrary
+            // origin), so it must NOT be fed to Date — it produced nonsense
+            // times like 13:08:51 for a 16:28 session.
+            String ts = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(new Date());
             String line = ts
                     + " disp=" + String.format("%.1f", disp)
                     + " src=" + String.format("%.1f", src)

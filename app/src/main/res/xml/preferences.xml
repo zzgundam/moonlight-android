@@ -201,6 +201,13 @@
             android:summary="@string/summary_checkbox_frame_interp_fbc"
             android:title="@string/title_checkbox_frame_interp_fbc"
             app:iconSpaceReserved="false" />
+        <CheckBoxPreference
+            android:defaultValue="false"
+            android:dependency="checkbox_frame_interp"
+            android:key="checkbox_frame_interp_diag_log"
+            android:summary="@string/summary_checkbox_frame_interp_diag_log"
+            android:title="@string/title_checkbox_frame_interp_diag_log"
+            app:iconSpaceReserved="false" />
         <com.limelight.preferences.SeekBarPreference
             android:key="parallax_depth"
             android:dialogMessage=""

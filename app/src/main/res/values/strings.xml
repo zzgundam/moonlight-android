@@ -749,6 +749,8 @@
     <string name="summary_frame_interp_multiplier">How many output frames per source frame (requires a display refresh rate of the same multiple).</string>
     <string name="title_checkbox_frame_interp_fbc">Occlusion check (FBC)</string>
     <string name="summary_checkbox_frame_interp_fbc">Off by default. Enable to run a second, reverse motion-estimation pass that detects occlusions and cuts down double images. Costs one extra GPU pass per frame (more GPU load and heat). Requires reconnecting the stream.</string>
+    <string name="title_checkbox_frame_interp_diag_log">Write diagnostics log</string>
+    <string name="summary_checkbox_frame_interp_diag_log">Off by default. Writes one line per second to Android/data/&lt;package&gt;/files/frame_interp_log.txt (loop rate, real/synthetic/repeat/gate-miss/stall rates, ingest cost, ME failure and invalid-pixel rates). Only for troubleshooting the interpolation cadence; it writes to storage so leave it off normally. Requires reconnecting the stream.</string>
     <string name="title_frame_interp_phase">Interp trigger phase</string>
     <string name="summary_frame_interp_phase">How much earlier a synthesized frame claims a refresh slot. Higher values make interpolation more aggressive when the source cadence is jittery, but can add slight motion artifacts. 0.0 keeps the original timing. Requires reconnecting the stream.</string>
     <string name="perf_overlay_interp_fps">Interp: %1$.2f &#8594; %2$.2f FPS (%3$s)</string>
