@@ -10,9 +10,15 @@ import android.view.Surface;
 import com.limelight.LimeLog;
 import com.limelight.preferences.PreferenceConfiguration;
 
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileWriter;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import javax.microedition.khronos.egl.EGLConfig;
@@ -145,6 +151,21 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     private long ingestAccumNs = 0;
     private int ingestCount = 0;
 
+    // Diagnostics: per-second cadence counters, mirrored to a file log so a
+    // session can be analysed offline (why the multiplier is not reached).
+    private int loopFrameCount = 0;      // every onDrawFrame callback
+    private int realPresentCount = 0;    // real frames swapped to screen
+    private int synthPresentCount = 0;   // synthetic frames swapped to screen
+    private int repeatPresentCount = 0;  // vsync slots that re-show the last frame
+    private int gateMissCount = 0;       // repeats where the phase gate was NOT reached
+    private int stallHoldCount = 0;      // stream-stall holds (progress > 1.35)
+
+    private Context logContext = null;
+    private File diagFile = null;
+    private BufferedWriter diagWriter = null;
+    private boolean diagSessionHeader = false;
+    private static final long DIAG_LOG_MAX_BYTES = 8L * 1024 * 1024;
+
     static {
         try {
             System.loadLibrary("frame-interp");
@@ -168,6 +189,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         this.glSurfaceView = view;
         this.onSurfaceReadyListener = listener;
         this.prefConfig = prefConfig;
+        this.logContext = context;
         this.fbcEnabled = prefConfig.frameInterpolationFbc;
         int phaseLevel = Math.max(0, Math.min(3, prefConfig.frameInterpolationPhase));
         this.phaseAdvance = phaseLevel * 0.10f;      // 0.0 / 0.1 / 0.2 / 0.3
@@ -315,6 +337,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     @Override
     public void onDrawFrame(GL10 gl) {
         long now = System.nanoTime();
+        loopFrameCount++;
 
         boolean newFrame;
         synchronized (frameLock) {
@@ -346,6 +369,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
                 }
             } else if (progress > stallThresh) {
                 // Stream stalled: hold the last real frame, no synthesis.
+                stallHoldCount++;
                 presentReal();
                 displayFrameCount++;
             } else {
@@ -365,6 +389,12 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
                     // No new slot this vsync: re-present the last frame so the
                     // back buffer always holds valid content (never garbage).
                     // A repeat, not a new displayed frame -> do NOT count it.
+                    repeatPresentCount++;
+                    if (slotsPresented == 0) {
+                        // Slot gate not reached yet: the phase never crossed
+                        // the threshold before the next real frame / this vsync.
+                        gateMissCount++;
+                    }
                     drawTextureToScreen(lastScreenTex);
                 }
             }
@@ -516,6 +546,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         }
         // After the swap in ingestFrame(), frameTexA holds the newest frame.
         drawTextureToScreen(frameTexA != 0 ? frameTexA : frameTexB);
+        realPresentCount++;
     }
 
     private void presentSynthetic(float phase, long now) {
@@ -527,6 +558,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             // still holds the previous pair's vectors. Hold the real frame
             // instead of synthesizing from stale motion (A3).
             drawTextureToScreen(frameTexA);
+            realPresentCount++;
             return;
         }
         synthCount++;
@@ -633,6 +665,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         }
 
         drawTextureToScreen(outTex);
+        synthPresentCount++;
     }
 
     // (H) Additive-accumulation telemetry pass. Runs at METRICS_RES x
@@ -1036,8 +1069,23 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             sourceFps = sourceFrameCount * 1_000_000_000f / elapsed;
             int realFrames = Math.max(1, sourceFrameCount);
             float meFailPct = 100.0f * meFailCount / realFrames;
+            float seconds = elapsed / 1_000_000_000f;
+            float loopHz = loopFrameCount / seconds;
+            float realFps = realPresentCount / seconds;
+            float synthFps = synthPresentCount / seconds;
+            float repeatFps = repeatPresentCount / seconds;
+            float gateMissFps = gateMissCount / seconds;
+            float stallFps = stallHoldCount / seconds;
+            float ingestAvgMs = (ingestCount > 0)
+                    ? (float) (ingestAccumNs / 1e6 / ingestCount) : -1.0f;
             displayFrameCount = 0;
             sourceFrameCount = 0;
+            loopFrameCount = 0;
+            realPresentCount = 0;
+            synthPresentCount = 0;
+            repeatPresentCount = 0;
+            gateMissCount = 0;
+            stallHoldCount = 0;
             fpsWindowStart = now;
 
             // (H) once-per-second telemetry readback: 256 texels from the
@@ -1068,18 +1116,100 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
                 }
             }
 
-            LimeLog.info("Frame interpolation: display=" + String.format("%.1f", displayFps)
+            String line = "Frame interpolation: display=" + String.format("%.1f", displayFps)
                     + " source=" + String.format("%.1f", sourceFps)
+                    + String.format(" loop=%.1fHz", loopHz)
+                    + String.format(" real=%.1f synth=%.1f", realFps, synthFps)
+                    + String.format(" repeat=%.1f gateMiss=%.1f stall=%.1f",
+                            repeatFps, gateMissFps, stallFps)
                     + " engine=" + engineString() + " x" + multiplier
                     + String.format(" phase=%.2f", phaseAdvance)
                     + String.format(" meFail=%.0f%%", meFailPct)
                     + String.format(" synth=%d", synthCount)
                     + (invalidRate >= 0.0f ? String.format(" invalid=%.1f%%", invalidRate * 100.0f) : "")
-                    + (ingestCount > 0 ? String.format(" ingestAvg=%.1fms", ingestAccumNs / 1e6 / ingestCount) : ""));
+                    + (ingestAvgMs >= 0.0f ? String.format(" ingestAvg=%.1fms", ingestAvgMs) : "");
+            LimeLog.info(line);
+            writeDiagLine(now, displayFps, sourceFps, loopHz, realFps, synthFps,
+                    repeatFps, gateMissFps, stallFps, meFailPct, invalidRate, ingestAvgMs);
             ingestAccumNs = 0;
             ingestCount = 0;
             meFailCount = 0;
             synthCount = 0;
+        }
+    }
+
+    // Mirror the once-per-second diagnostics line to
+    // /sdcard/Android/data/<pkg>/files/frame_interp_log.txt (one line per
+    // second, session headers, 8 MB rotation). Failures are swallowed:
+    // diagnostics must never break rendering.
+    private void writeDiagLine(long now, float disp, float src, float loopHz,
+                               float realFps, float synthFps, float repeatFps,
+                               float gateMissFps, float stallFps, float meFailPct,
+                               float invalidRate, float ingestAvgMs) {
+        try {
+            if (logContext == null) {
+                return;
+            }
+            if (diagFile == null) {
+                File dir = logContext.getExternalFilesDir(null);
+                if (dir == null) {
+                    return;
+                }
+                diagFile = new File(dir, "frame_interp_log.txt");
+            }
+            boolean rotate = diagFile.exists() && diagFile.length() > DIAG_LOG_MAX_BYTES;
+            if (diagWriter == null || rotate) {
+                if (diagWriter != null) {
+                    try {
+                        diagWriter.close();
+                    } catch (Exception ignored) {
+                    }
+                    diagWriter = null;
+                }
+                boolean append = !rotate && !diagSessionHeader
+                        && diagFile.exists() && diagFile.length() > 0;
+                diagWriter = new BufferedWriter(new FileWriter(diagFile, append));
+                diagSessionHeader = true;
+                String header = "# session start "
+                        + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date());
+                diagWriter.write(header);
+                diagWriter.newLine();
+            }
+            String ts = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(new Date(now));
+            String line = ts
+                    + " disp=" + String.format("%.1f", disp)
+                    + " src=" + String.format("%.1f", src)
+                    + " loop=" + String.format("%.1f", loopHz) + "Hz"
+                    + " real=" + String.format("%.1f", realFps)
+                    + " synth=" + String.format("%.1f", synthFps)
+                    + " rep=" + String.format("%.1f", repeatFps)
+                    + " gateMiss=" + String.format("%.1f", gateMissFps)
+                    + " stall=" + String.format("%.1f", stallFps)
+                    + " meFail=" + String.format("%.0f%%", meFailPct)
+                    + (invalidRate >= 0.0f ? " invalid=" + String.format("%.1f%%", invalidRate * 100.0f) : "")
+                    + (ingestAvgMs >= 0.0f ? " ingest=" + String.format("%.1fms", ingestAvgMs) : "");
+            diagWriter.write(line);
+            diagWriter.newLine();
+            diagWriter.flush();
+        } catch (Exception e) {
+            LimeLog.warning("Frame interp diag log: " + e.getMessage());
+            if (diagWriter != null) {
+                try {
+                    diagWriter.close();
+                } catch (Exception ignored) {
+                }
+                diagWriter = null;
+            }
+        }
+    }
+
+    private void closeDiagLog() {
+        if (diagWriter != null) {
+            try {
+                diagWriter.close();
+            } catch (Exception ignored) {
+            }
+            diagWriter = null;
         }
     }
 
@@ -1093,6 +1223,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
 
     public void onSurfaceDestroyed() {
         LimeLog.info("Shutting down frame interpolation renderer.");
+        closeDiagLog();
         synchronized (frameLock) {
             frameAvailable.set(false);
         }
