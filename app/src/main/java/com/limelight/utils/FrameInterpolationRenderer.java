@@ -65,7 +65,11 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     // curr samples disagree by more than this (average RGB difference, 0..1),
     // the motion is not trustworthy (scene cut, wrong MV, occlusion) and the
     // synthesis falls back to the nearest real frame instead of blending.
+    // User-tunable ("interp confidence gate"): the original fixed 0.22 passed
+    // video content wholesale — motion blur and codec noise sit at 5-15%
+    // mismatch, so nearly every pixel blended and panning shots ghosted.
     private static final float CUT_THRESHOLD = 0.22f;
+    private static final float[] GATE_THRESHOLDS = {0.22f, 0.15f, 0.12f, 0.08f};
 
     private static final long MIN_FRAME_INTERVAL_NS = 1_000_000L;
     private static final long MAX_FRAME_INTERVAL_NS = 100_000_000L;
@@ -87,6 +91,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     private final boolean fbcEnabled;   // user setting: backward ME / FBC occlusion check
     private final float phaseAdvance;   // user setting: how much earlier synthetic frames claim a vsync slot
     private final double stallThresh;   // user setting: progress beyond which the stream is treated as stalled
+    private final float cutThreshold;   // user setting: post-compensation residual gate (ghosting vs coverage)
 
     private final FloatBuffer quadVertexBuffer;
     private final FloatBuffer textureVertexBuffer;
@@ -196,6 +201,8 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
         int phaseLevel = Math.max(0, Math.min(3, prefConfig.frameInterpolationPhase));
         this.phaseAdvance = phaseLevel * 0.10f;      // 0.0 / 0.1 / 0.2 / 0.3
         this.stallThresh = 1.35 + phaseLevel * 0.15; // 1.35 / 1.50 / 1.65 / 1.80
+        int gateLevel = Math.max(0, Math.min(3, prefConfig.frameInterpolationGate));
+        this.cutThreshold = GATE_THRESHOLDS[gateLevel]; // 0.22 / 0.15 / 0.12 / 0.08
         FrameInterpolationRenderer.multiplier = Math.max(2, Math.min(4, prefConfig.frameInterpolationMultiplier));
         // Seed the cadence estimate from the configured stream FPS instead of
         // assuming 60; a 30 FPS source would otherwise look "stalled" for the
@@ -604,7 +611,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
                 ? Math.max(24.0f, frameWidth * 0.10f)
                 : MV_RANGE * 4.0f;
         GLES20.glUniform1f(GLES20.glGetUniformLocation(synthProgram, "uMaxMV"), maxMv);
-        GLES20.glUniform1f(GLES20.glGetUniformLocation(synthProgram, "uCutThresh"), CUT_THRESHOLD);
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(synthProgram, "uCutThresh"), cutThreshold);
         GLES20.glUniform2f(GLES20.glGetUniformLocation(synthProgram, "uMvGrid"),
                 Math.max(1, mvGridW), Math.max(1, mvGridH));
         // Motion-field divergence gate. QCOM vectors are large (calibrated to
@@ -1777,7 +1784,10 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
             "    float res = dot(abs(cPrev.rgb - cCurr.rgb), vec3(0.3333));\n" +
             "\n" +
             "    float vConf = smoothstep(0.05, 0.35, conf);\n" +
-            "    float vRes  = 1.0 - smoothstep(uCutThresh, uCutThresh + 0.18, res);\n" +
+            "    // Transition width scales with the gate (1.8x), so a strict\n" +
+            "    // threshold also gets a steeper falloff instead of a wide\n" +
+            "    // partially-trusted band (0.22*1.8 ~= the original fixed +0.18).\n" +
+            "    float vRes  = 1.0 - smoothstep(uCutThresh, uCutThresh * 1.8, res);\n" +
             "    float vDiv  = 1.0 - smoothstep(uDivThresh, uDivThresh * 1.8, div);\n" +
             "    float valid = vConf * vRes * vDiv * (1.0 - outside);\n" +
             "\n" +

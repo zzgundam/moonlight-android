@@ -725,5 +725,7 @@
     <string name="summary_checkbox_frame_interp_diag_log">默认关闭。开启后每秒向 Android/data/&lt;包名&gt;/files/frame_interp_log.txt 追加一行诊断数据（渲染循环频率、真帧/合成帧/重复/丢槽/卡顿比例、取帧耗时、ME 失败率与无效像素率），仅用于排查插帧节奏问题。会持续写存储，平时请保持关闭。修改后需重新连接串流生效。</string>
     <string name="title_frame_interp_phase">插帧触发相位</string>
     <string name="summary_frame_interp_phase">合成帧提前占用刷新槽的程度。数值越大，源帧节奏抖动时插帧越激进、越不容易丢帧，但可能略增运动伪影。0.0 保持原有节奏。修改后需重新连接串流生效。</string>
+    <string name="title_frame_interp_gate">插帧置信门槛</string>
+    <string name="summary_frame_interp_gate">逐像素前后帧失配超过该阈值时，合成结果回退为最近的真实帧。数值越低越能抑制视频内容的重影（运动模糊、编码噪声），代价是运动平滑度下降。0.22 为原始值、适合干净的游戏画面；视频内容建议 0.12。修改后需重新连接串流生效。</string>
     <string name="perf_overlay_interp_fps">插帧： %1$.2f &#8594; %2$.2f FPS (%3$s)</string>
 </resources>

@@ -222,4 +222,16 @@
     <item>2</item>
     <item>3</item>
     </string-array>
+    <string-array name="frame_interp_gate_names" translatable="false">
+    <item>0.22 (loose)</item>
+    <item>0.15</item>
+    <item>0.12 (strict)</item>
+    <item>0.08 (strictest)</item>
+    </string-array>
+    <string-array name="frame_interp_gate_values" translatable="false">
+    <item>0</item>
+    <item>1</item>
+    <item>2</item>
+    <item>3</item>
+    </string-array>
 </resources>

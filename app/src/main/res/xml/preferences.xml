@@ -194,6 +194,15 @@
             android:summary="@string/summary_frame_interp_phase"
             android:title="@string/title_frame_interp_phase"
             app:iconSpaceReserved="false" />
+        <ListPreference
+            android:defaultValue="2"
+            android:dependency="checkbox_frame_interp"
+            android:entries="@array/frame_interp_gate_names"
+            android:entryValues="@array/frame_interp_gate_values"
+            android:key="list_frame_interp_gate"
+            android:summary="@string/summary_frame_interp_gate"
+            android:title="@string/title_frame_interp_gate"
+            app:iconSpaceReserved="false" />
         <CheckBoxPreference
             android:defaultValue="false"
             android:dependency="checkbox_frame_interp"

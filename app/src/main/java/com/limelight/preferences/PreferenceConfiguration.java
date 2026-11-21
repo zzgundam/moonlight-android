@@ -83,6 +83,7 @@ public class PreferenceConfiguration {
     public static final String FRAME_INTERP_PHASE_PREF_STRING = "list_frame_interp_phase";
     public static final String FRAME_INTERP_FBC_PREF_STRING = "checkbox_frame_interp_fbc";
     public static final String FRAME_INTERP_DIAG_LOG_PREF_STRING = "checkbox_frame_interp_diag_log";
+    public static final String FRAME_INTERP_GATE_PREF_STRING = "list_frame_interp_gate";
     private static final String VIBRATE_FALLBACK_PREF_STRING = "checkbox_vibrate_fallback";
     private static final String VIBRATE_FALLBACK_STRENGTH_PREF_STRING = "seekbar_vibrate_fallback_strength";
     private static final String FLIP_FACE_BUTTONS_PREF_STRING = "checkbox_flip_face_buttons";
@@ -154,6 +155,7 @@ public class PreferenceConfiguration {
     private static final int DEFAULT_FRAME_INTERP_PHASE = 0;
     private static final boolean DEFAULT_FRAME_INTERP_FBC = false;
     private static final boolean DEFAULT_FRAME_INTERP_DIAG_LOG = false;
+    private static final int DEFAULT_FRAME_INTERP_GATE = 2;
     private static final String DEFAULT_VIDEO_SCALE_MODE = "fit";
     private static final boolean DEFAULT_AUTO_INVERT_VIDEO_RESOLUTION = true;
     private static final int DEFAULT_RESOLUTION_SCALE_FACTOR = 100;
@@ -265,6 +267,7 @@ public class PreferenceConfiguration {
     public int frameInterpolationPhase;
     public boolean frameInterpolationFbc;
     public boolean frameInterpolationDiagLog;
+    public int frameInterpolationGate;
     public boolean smallIconMode, multiController, usbDriver, flipFaceButtons;
     public boolean onscreenController;
     public boolean hideOSCWhenHasGamepad;
@@ -934,6 +937,16 @@ private static int getFramePacingValue(Context context) {
         config.frameInterpolationFbc = prefs.getBoolean(FRAME_INTERP_FBC_PREF_STRING, DEFAULT_FRAME_INTERP_FBC);
         config.frameInterpolationDiagLog = prefs.getBoolean(FRAME_INTERP_DIAG_LOG_PREF_STRING,
                 DEFAULT_FRAME_INTERP_DIAG_LOG);
+        try {
+            config.frameInterpolationGate = Integer.parseInt(
+                    prefs.getString(FRAME_INTERP_GATE_PREF_STRING,
+                            String.valueOf(DEFAULT_FRAME_INTERP_GATE)));
+        } catch (NumberFormatException e) {
+            config.frameInterpolationGate = DEFAULT_FRAME_INTERP_GATE;
+        }
+        if (config.frameInterpolationGate < 0 || config.frameInterpolationGate > 3) {
+            config.frameInterpolationGate = DEFAULT_FRAME_INTERP_GATE;
+        }
 
         // Read mouse mode and set touch settings accordingly
         String mouseMode = prefs.getString("mouse_mode_list", "0");
