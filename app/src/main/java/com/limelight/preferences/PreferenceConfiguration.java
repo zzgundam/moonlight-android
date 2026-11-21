@@ -270,6 +270,7 @@ public class PreferenceConfiguration {
     public boolean frameInterpolationFbc;
     public boolean frameInterpolationDiagLog;
     public int frameInterpolationGate;
+    public int frameInterpolationBlur;
     public boolean smallIconMode, multiController, usbDriver, flipFaceButtons;
     public boolean onscreenController;
     public boolean hideOSCWhenHasGamepad;
@@ -948,6 +949,17 @@ private static int getFramePacingValue(Context context) {
         }
         if (config.frameInterpolationGate < 0 || config.frameInterpolationGate > 3) {
             config.frameInterpolationGate = DEFAULT_FRAME_INTERP_GATE;
+        }
+
+        try {
+            config.frameInterpolationBlur = Integer.parseInt(
+                    prefs.getString(FRAME_INTERP_BLUR_PREF_STRING,
+                            String.valueOf(DEFAULT_FRAME_INTERP_BLUR)));
+        } catch (NumberFormatException e) {
+            config.frameInterpolationBlur = DEFAULT_FRAME_INTERP_BLUR;
+        }
+        if (config.frameInterpolationBlur < 0 || config.frameInterpolationBlur > 3) {
+            config.frameInterpolationBlur = DEFAULT_FRAME_INTERP_BLUR;
         }
 
         // Read mouse mode and set touch settings accordingly

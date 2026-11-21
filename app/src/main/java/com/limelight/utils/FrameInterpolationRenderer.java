@@ -757,6 +757,7 @@ public class FrameInterpolationRenderer implements GLSurfaceView.Renderer, Surfa
     private int blendCurIdx = 0;                 // texture written this pass
     private int blendFbo = 0;
     private boolean blendHistoryValid = false;
+    private int lastContentTex = 0;              // last raw source texture presented
     private final float[] identityMatrix = {
             1.0f, 0.0f, 0.0f, 0.0f,
             0.0f, 1.0f, 0.0f, 0.0f,
