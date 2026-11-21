@@ -1441,9 +1441,9 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
             if (mult < 2 || mult > 4) {
                 mult = 2;
             }
-            return prefConfig.fps * mult;
+            return Math.round(prefConfig.fps) * mult;
         }
-        return (prefConfig != null && prefConfig.fps > 0) ? prefConfig.fps : 60;
+        return (prefConfig != null && prefConfig.fps > 0) ? Math.round(prefConfig.fps) : 60;
     }
 
     private boolean isRefreshRateEqualMatch(float refreshRate) {
